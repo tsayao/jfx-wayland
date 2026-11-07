@@ -186,39 +186,30 @@ public class CompileSPIRVTask extends DefaultTask {
         private final MemorySegment options;
 
         private Shaderc(SymbolLookup lib) throws Throwable {
-            Linker linker = Linker.nativeLinker();
             ValueLayout ptr = ValueLayout.ADDRESS;
             ValueLayout i32 = ValueLayout.JAVA_INT;
-            MethodHandle compilerInit = linker.downcallHandle(lib.find("shaderc_compiler_initialize").orElseThrow(),
-                    FunctionDescriptor.of(ptr));
-            MethodHandle optionsInit = linker.downcallHandle(lib.find("shaderc_compile_options_initialize").orElseThrow(),
-                    FunctionDescriptor.of(ptr));
-            MethodHandle setTargetEnv = linker.downcallHandle(lib.find("shaderc_compile_options_set_target_env").orElseThrow(),
-                    FunctionDescriptor.ofVoid(ptr, i32, i32));
-            MethodHandle setOptimization = linker.downcallHandle(
-                    lib.find("shaderc_compile_options_set_optimization_level").orElseThrow(),
-                    FunctionDescriptor.ofVoid(ptr, i32));
-            compileIntoSpv = linker.downcallHandle(lib.find("shaderc_compile_into_spv").orElseThrow(),
+            compileIntoSpv = function(lib, "shaderc_compile_into_spv",
                     FunctionDescriptor.of(ptr, ptr, ptr, ValueLayout.JAVA_LONG, i32, ptr, ptr, ptr));
-            getStatus = linker.downcallHandle(lib.find("shaderc_result_get_compilation_status").orElseThrow(),
-                    FunctionDescriptor.of(i32, ptr));
-            getLength = linker.downcallHandle(lib.find("shaderc_result_get_length").orElseThrow(),
-                    FunctionDescriptor.of(ValueLayout.JAVA_LONG, ptr));
-            getBytes = linker.downcallHandle(lib.find("shaderc_result_get_bytes").orElseThrow(),
-                    FunctionDescriptor.of(ptr, ptr));
-            getError = linker.downcallHandle(lib.find("shaderc_result_get_error_message").orElseThrow(),
-                    FunctionDescriptor.of(ptr, ptr));
-            releaseResult = linker.downcallHandle(lib.find("shaderc_result_release").orElseThrow(),
-                    FunctionDescriptor.ofVoid(ptr));
-            releaseCompiler = linker.downcallHandle(lib.find("shaderc_compiler_release").orElseThrow(),
-                    FunctionDescriptor.ofVoid(ptr));
-            releaseOptions = linker.downcallHandle(lib.find("shaderc_compile_options_release").orElseThrow(),
-                    FunctionDescriptor.ofVoid(ptr));
+            getStatus = function(lib, "shaderc_result_get_compilation_status", FunctionDescriptor.of(i32, ptr));
+            getLength = function(lib, "shaderc_result_get_length", FunctionDescriptor.of(ValueLayout.JAVA_LONG, ptr));
+            getBytes = function(lib, "shaderc_result_get_bytes", FunctionDescriptor.of(ptr, ptr));
+            getError = function(lib, "shaderc_result_get_error_message", FunctionDescriptor.of(ptr, ptr));
+            releaseResult = function(lib, "shaderc_result_release", FunctionDescriptor.ofVoid(ptr));
+            releaseCompiler = function(lib, "shaderc_compiler_release", FunctionDescriptor.ofVoid(ptr));
+            releaseOptions = function(lib, "shaderc_compile_options_release", FunctionDescriptor.ofVoid(ptr));
+            compiler = (MemorySegment) function(lib, "shaderc_compiler_initialize", FunctionDescriptor.of(ptr))
+                    .invokeExact();
+            options = (MemorySegment) function(lib, "shaderc_compile_options_initialize", FunctionDescriptor.of(ptr))
+                    .invokeExact();
+            // SPIR-V for Vulkan 1.3, optimized for performance
+            function(lib, "shaderc_compile_options_set_target_env", FunctionDescriptor.ofVoid(ptr, i32, i32))
+                    .invokeExact(options, SHADERC_TARGET_ENV_VULKAN, SHADERC_ENV_VERSION_VULKAN_1_3);
+            function(lib, "shaderc_compile_options_set_optimization_level", FunctionDescriptor.ofVoid(ptr, i32))
+                    .invokeExact(options, SHADERC_OPTIMIZATION_LEVEL_PERFORMANCE);
+        }
 
-            compiler = (MemorySegment) compilerInit.invokeExact();
-            options = (MemorySegment) optionsInit.invokeExact();
-            setTargetEnv.invokeExact(options, SHADERC_TARGET_ENV_VULKAN, SHADERC_ENV_VERSION_VULKAN_1_3);
-            setOptimization.invokeExact(options, SHADERC_OPTIMIZATION_LEVEL_PERFORMANCE);
+        private static MethodHandle function(SymbolLookup lib, String name, FunctionDescriptor descriptor) {
+            return Linker.nativeLinker().downcallHandle(lib.find(name).orElseThrow(), descriptor);
         }
 
         static Shaderc load() {
@@ -245,24 +236,36 @@ public class CompileSPIRVTask extends DefaultTask {
                     throw new GradleException("shaderc failed for " + file, t);
                 }
                 try {
-                    int status = (int) getStatus.invokeExact(result);
-                    if (status != 0) {
-                        MemorySegment msg = ((MemorySegment) getError.invokeExact(result)).reinterpret(Long.MAX_VALUE);
-                        throw new GradleException("Cannot compile " + file + ":\n" + msg.getString(0));
-                    }
-                    long length = (long) getLength.invokeExact(result);
-                    MemorySegment bytes = ((MemorySegment) getBytes.invokeExact(result)).reinterpret(length);
-                    return bytes.toArray(ValueLayout.JAVA_BYTE);
-                } catch (GradleException e) {
-                    throw e;
-                } catch (Throwable t) {
-                    throw new GradleException("shaderc failed for " + file, t);
+                    return spirvOf(result, file);
                 } finally {
-                    try {
-                        releaseResult.invokeExact(result);
-                    } catch (Throwable ignored) {
-                    }
+                    release(result);
                 }
+            }
+        }
+
+        /** The SPIR-V of a result, or the error message of the compiler as an exception. */
+        private byte[] spirvOf(MemorySegment result, Path file) {
+            try {
+                int status = (int) getStatus.invokeExact(result);
+                if (status != 0) {
+                    MemorySegment msg = ((MemorySegment) getError.invokeExact(result)).reinterpret(Long.MAX_VALUE);
+                    throw new GradleException("Cannot compile " + file + ":\n" + msg.getString(0));
+                }
+                long length = (long) getLength.invokeExact(result);
+                MemorySegment bytes = ((MemorySegment) getBytes.invokeExact(result)).reinterpret(length);
+                return bytes.toArray(ValueLayout.JAVA_BYTE);
+            } catch (GradleException e) {
+                throw e;
+            } catch (Throwable t) {
+                throw new GradleException("shaderc failed for " + file, t);
+            }
+        }
+
+        private void release(MemorySegment result) {
+            try {
+                releaseResult.invokeExact(result);
+            } catch (Throwable ignored) {
+                // Nothing to do
             }
         }
 

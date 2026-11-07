@@ -37,6 +37,7 @@ import org.w3c.dom.NodeList;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -262,6 +263,26 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
 
     @TaskAction
     public void generate() throws Exception {
+        clearState();
+        List<Element> parsedRoots = parseGirFiles();
+        resolveHierarchy();
+        resolveStructLayouts();
+        Set<String> targetKeys = resolveTargetCTypes();
+        generatedTypes.clear();
+        generatedTypes.addAll(targetKeys);
+        for (Element root : parsedRoots) {
+            for (Element ns : childElements(root, "namespace")) {
+                parseNamespaceMembers(ns, targetKeys);
+            }
+        }
+        if (targetKeys.isEmpty()) {
+            getLogger().warn("No classes to generate. Set includeClasses or includeNamespaceFunctions.");
+            return;
+        }
+        writeSources(targetKeys);
+    }
+
+    private void clearState() {
         classRegistry.clear();
         nsTypePrefix.clear();
         enumCTypes.clear();
@@ -269,111 +290,122 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
         aliasTargets.clear();
         compounds.clear();
         callbacks.clear();
+    }
 
+    /** Parses the GIR files that exist, and registers their namespaces and types. */
+    private List<Element> parseGirFiles() throws Exception {
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
         factory.setNamespaceAware(false);
         factory.setValidating(false);
         factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
         DocumentBuilder builder = factory.newDocumentBuilder();
         builder.setErrorHandler(null);
-
         List<Element> parsedRoots = new ArrayList<>();
         for (File f : girFiles) {
-            if (f.exists()) {
-                Document doc = builder.parse(f);
-                Element root = doc.getDocumentElement();
-                parsedRoots.add(root);
-                for (Element ns : childElements(root, "namespace")) {
-                    registerNamespaceAndClassStubs(ns);
-                }
-            } else {
+            if (!f.exists()) {
                 getLogger().warn("GIR file not found, skipping: " + f);
+                continue;
             }
-        }
-
-        resolveHierarchy();
-        resolveStructLayouts();
-
-        Set<String> targetKeys = resolveTargetCTypes();
-        generatedTypes.clear();
-        generatedTypes.addAll(targetKeys);
-
-        for (Element root : parsedRoots) {
+            Element root = builder.parse(f).getDocumentElement();
+            parsedRoots.add(root);
             for (Element ns : childElements(root, "namespace")) {
-                String nsName = attr(ns, "name");
-                for (Element klass : childElements(ns, "class")) {
-                    parseClassMethods(klass, nsName, targetKeys);
-                }
-                for (Element rec : childElements(ns, "record")) {
-                    parseClassMethods(rec, nsName, targetKeys);
-                }
-                for (Element iface : childElements(ns, "interface")) {
-                    parseClassMethods(iface, nsName, targetKeys);
-                }
-                String nsKey = NS_KEY_PREFIX + nsName;
-                if (classRegistry.containsKey(nsKey)) {
-                    ClassDef nsDef = classRegistry.get(nsKey);
-                    for (Element func : childElements(ns, "function")) {
-                        MethodDef m = parseMethodNode(func, nsName, null, false, targetKeys);
-                        if (m != null) {
-                            m.isStatic = true;
-                            nsDef.methods.add(m);
-                        }
-                    }
-                    for (Element constNode : childElements(ns, "constant")) {
-                        if ("1".equals(attr(constNode, "deprecated"))) continue;
-                        String cName = attr(constNode, "name");
-                        String cValue = attr(constNode, "value");
-                        if (cName.isEmpty()) continue;
-                        List<Element> typeNodes = childElements(constNode, "type");
-                        if (typeNodes.isEmpty()) continue;
-                        String typeName = attr(typeNodes.get(0), "name");
-                        String jType = PRIMITIVE_TYPE_MAP.get(typeName);
-                        if (jType == null || jType.equals("void") || jType.equals("MemorySegment") || jType.equals("boolean")) continue;
-                        String literal = toJavaLiteral(jType, cValue);
-                        if (literal == null) continue;
-                        ConstDef cd = new ConstDef();
-                        cd.name = cName;
-                        cd.value = literal;
-                        cd.type = jType;
-                        nsDef.constants.add(cd);
-                    }
-                    String cSymPfx = nsSymbolPrefix.getOrDefault(nsName, nsName.toUpperCase() + "_");
-                    for (String tag : Arrays.asList("enumeration", "bitfield")) {
-                        for (Element enumNode : childElements(ns, tag)) {
-                            if ("1".equals(attr(enumNode, "deprecated"))) continue;
-                            for (Element member : childElements(enumNode, "member")) {
-                                if ("1".equals(attr(member, "deprecated"))) continue;
-                                String memberId = attr(member, "c:identifier");
-                                String memberVal = attr(member, "value");
-                                if (memberId.isEmpty()) continue;
-                                try {
-                                    Integer.parseInt(memberVal);
-                                } catch (NumberFormatException e) {
-                                    continue;
-                                }
-                                String constName = memberId.startsWith(cSymPfx) ? memberId.substring(cSymPfx.length()) : memberId;
-                                ConstDef cd = new ConstDef();
-                                cd.name = constName;
-                                cd.value = memberVal;
-                                cd.type = "int";
-                                nsDef.constants.add(cd);
-                            }
-                        }
-                    }
-                }
+                registerNamespaceAndClassStubs(ns);
             }
         }
+        return parsedRoots;
+    }
 
-        if (targetKeys.isEmpty()) {
-            getLogger().warn("No classes to generate. Set includeClasses or includeNamespaceFunctions.");
+    /** The methods of the classes, records and interfaces, and the functions and constants of a namespace. */
+    private void parseNamespaceMembers(Element ns, Set<String> targetKeys) {
+        String nsName = attr(ns, "name");
+        for (String tag : List.of("class", "record", "interface")) {
+            for (Element type : childElements(ns, tag)) {
+                parseClassMethods(type, nsName, targetKeys);
+            }
+        }
+        ClassDef nsDef = classRegistry.get(NS_KEY_PREFIX + nsName);
+        if (nsDef == null) {
             return;
         }
+        for (Element func : childElements(ns, "function")) {
+            MethodDef m = parseMethodNode(func, nsName, null, false, targetKeys);
+            if (m != null) {
+                m.isStatic = true;
+                nsDef.methods.add(m);
+            }
+        }
+        for (Element constNode : childElements(ns, "constant")) {
+            ConstDef cd = parseConstant(constNode);
+            if (cd != null) {
+                nsDef.constants.add(cd);
+            }
+        }
+        addEnumConstants(ns, nsDef, nsSymbolPrefix.getOrDefault(nsName, nsName.toUpperCase() + "_"));
+    }
 
-        String packagePath = packageName.replace('.', File.separatorChar);
-        File packageDir = new File(outputDir, packagePath);
+    /** A constant of a primitive type other than boolean, or null. */
+    private ConstDef parseConstant(Element constNode) {
+        String cName = attr(constNode, "name");
+        List<Element> typeNodes = childElements(constNode, "type");
+        if ("1".equals(attr(constNode, "deprecated")) || cName.isEmpty() || typeNodes.isEmpty()) {
+            return null;
+        }
+        String jType = PRIMITIVE_TYPE_MAP.get(attr(typeNodes.get(0), "name"));
+        if (jType == null || jType.equals("void") || jType.equals("MemorySegment") || jType.equals("boolean")) {
+            return null;
+        }
+        String literal = toJavaLiteral(jType, attr(constNode, "value"));
+        return literal == null ? null : constDef(cName, literal, jType);
+    }
+
+    /** The members of the enumerations and bitfields, as int constants without the prefix of the namespace. */
+    private void addEnumConstants(Element ns, ClassDef nsDef, String symbolPrefix) {
+        for (String tag : List.of("enumeration", "bitfield")) {
+            for (Element enumNode : childElements(ns, tag)) {
+                if ("1".equals(attr(enumNode, "deprecated"))) {
+                    continue;
+                }
+                for (Element member : childElements(enumNode, "member")) {
+                    ConstDef cd = enumConstant(member, symbolPrefix);
+                    if (cd != null) {
+                        nsDef.constants.add(cd);
+                    }
+                }
+            }
+        }
+    }
+
+    private static ConstDef enumConstant(Element member, String symbolPrefix) {
+        String memberId = attr(member, "c:identifier");
+        String memberVal = attr(member, "value");
+        if ("1".equals(attr(member, "deprecated")) || memberId.isEmpty() || !isInt(memberVal)) {
+            return null;
+        }
+        String name = memberId.startsWith(symbolPrefix) ? memberId.substring(symbolPrefix.length()) : memberId;
+        return constDef(name, memberVal, "int");
+    }
+
+    private static boolean isInt(String value) {
+        try {
+            Integer.parseInt(value);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    private static ConstDef constDef(String name, String value, String type) {
+        ConstDef cd = new ConstDef();
+        cd.name = name;
+        cd.value = value;
+        cd.type = type;
+        return cd;
+    }
+
+    /** Writes a source file for each class to generate. */
+    private void writeSources(Set<String> targetKeys) throws IOException {
+        File packageDir = new File(outputDir, packageName.replace('.', File.separatorChar));
         packageDir.mkdirs();
-
         for (String key : targetKeys) {
             ClassDef classDef = classRegistry.get(key);
             if (classDef == null) {
@@ -384,80 +416,98 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
                 // the namespace shares its name with a generated class, e.g. GObject
                 classDef.name = classDef.name + "Functions";
             }
-            String source = generateClassSource(classDef);
             String fileName = (classDef.isNamespaceClass ? classDef.name : classDef.cType) + ".java";
-            Files.writeString(new File(packageDir, fileName).toPath(), source);
+            Files.writeString(new File(packageDir, fileName).toPath(), generateClassSource(classDef));
             getLogger().lifecycle("Generated: " + fileName);
         }
     }
 
     private void registerNamespaceAndClassStubs(Element ns) {
         String nsName = attr(ns, "name");
-        String cIdPrefixes = attr(ns, "c:identifier-prefixes");
-        String nsPrefix = !cIdPrefixes.isEmpty() ? cIdPrefixes.split(",")[0].trim() : nsName;
+        String nsPrefix = firstPrefix(attr(ns, "c:identifier-prefixes"), nsName);
         nsTypePrefix.put(nsName, nsPrefix);
-
-        String cSymPrefixes = attr(ns, "c:symbol-prefixes");
-        String cSymPrefix = !cSymPrefixes.isEmpty()
-            ? cSymPrefixes.split(",")[0].trim().toUpperCase() + "_"
-            : nsPrefix.toUpperCase() + "_";
-        nsSymbolPrefix.put(nsName, cSymPrefix);
-
+        nsSymbolPrefix.put(nsName, firstPrefix(attr(ns, "c:symbol-prefixes"), nsPrefix).toUpperCase() + "_");
         for (Element klass : childElements(ns, "class")) {
-            String cType = attr(klass, "c:type");
-            if (!cType.isEmpty()) {
-                ClassDef def = new ClassDef();
-                def.name = attr(klass, "name");
-                def.namespace = nsName;
-                def.cType = cType;
-                def.parentGirName = attr(klass, "parent");
-                def.getTypeFunc = attr(klass, "glib:get-type");
-                for (Element impl : childElements(klass, "implements")) {
-                    def.implementsGirNames.add(attr(impl, "name"));
-                }
-                classRegistry.put(cType, def);
-            }
+            registerClass(klass, nsName);
         }
-
         for (Element rec : childElements(ns, "record")) {
             compounds.put(nsName + "." + attr(rec, "name"), rec);
-            String cType = attr(rec, "c:type");
-            if (cType.isEmpty()) continue;
-            ClassDef def = new ClassDef();
-            def.name = attr(rec, "name");
-            def.namespace = nsName;
-            def.cType = cType;
-            def.isRecord = true;
-            def.element = rec;
-            def.getTypeFunc = attr(rec, "glib:get-type");
-            classRegistry.put(cType, def);
+            registerRecord(rec, nsName);
         }
-
         for (Element union : childElements(ns, "union")) {
             compounds.put(nsName + "." + attr(union, "name"), union);
         }
-
         for (Element callback : childElements(ns, "callback")) {
             callbacks.add(nsName + "." + attr(callback, "name"));
         }
-
         for (Element iface : childElements(ns, "interface")) {
-            String cType = attr(iface, "c:type");
-            if (!cType.isEmpty()) {
-                ClassDef def = new ClassDef();
-                def.name = attr(iface, "name");
-                def.namespace = nsName;
-                def.cType = cType;
-                def.isInterface = true;
-                def.getTypeFunc = attr(iface, "glib:get-type");
-                for (Element prereq : childElements(iface, "prerequisite")) {
-                    def.prerequisiteGirNames.add(attr(prereq, "name"));
-                }
-                classRegistry.put(cType, def);
-            }
+            registerInterface(iface, nsName);
         }
+        registerEnumsAndAliases(ns, nsName);
+        if (includeNamespaceFunctions.contains(nsName)) {
+            ClassDef def = classStub(nsName, nsName, nsName);
+            def.isNamespaceClass = true;
+            classRegistry.put(NS_KEY_PREFIX + nsName, def);
+        }
+    }
 
-        for (String tag : Arrays.asList("enumeration", "bitfield")) {
+    /** The first of a comma separated list of prefixes, or a default when there is none. */
+    private static String firstPrefix(String prefixes, String defaultPrefix) {
+        return prefixes.isEmpty() ? defaultPrefix : prefixes.split(",")[0].trim();
+    }
+
+    /** A class definition without its members yet. */
+    private static ClassDef classStub(String name, String namespace, String cType) {
+        ClassDef def = new ClassDef();
+        def.name = name;
+        def.namespace = namespace;
+        def.cType = cType;
+        return def;
+    }
+
+    private void registerClass(Element klass, String nsName) {
+        String cType = attr(klass, "c:type");
+        if (cType.isEmpty()) {
+            return;
+        }
+        ClassDef def = classStub(attr(klass, "name"), nsName, cType);
+        def.parentGirName = attr(klass, "parent");
+        def.getTypeFunc = attr(klass, "glib:get-type");
+        for (Element impl : childElements(klass, "implements")) {
+            def.implementsGirNames.add(attr(impl, "name"));
+        }
+        classRegistry.put(cType, def);
+    }
+
+    private void registerRecord(Element rec, String nsName) {
+        String cType = attr(rec, "c:type");
+        if (cType.isEmpty()) {
+            return;
+        }
+        ClassDef def = classStub(attr(rec, "name"), nsName, cType);
+        def.isRecord = true;
+        def.element = rec;
+        def.getTypeFunc = attr(rec, "glib:get-type");
+        classRegistry.put(cType, def);
+    }
+
+    private void registerInterface(Element iface, String nsName) {
+        String cType = attr(iface, "c:type");
+        if (cType.isEmpty()) {
+            return;
+        }
+        ClassDef def = classStub(attr(iface, "name"), nsName, cType);
+        def.isInterface = true;
+        def.getTypeFunc = attr(iface, "glib:get-type");
+        for (Element prereq : childElements(iface, "prerequisite")) {
+            def.prerequisiteGirNames.add(attr(prereq, "name"));
+        }
+        classRegistry.put(cType, def);
+    }
+
+    /** The C types of the enumerations and bitfields, and the targets of the aliases. */
+    private void registerEnumsAndAliases(Element ns, String nsName) {
+        for (String tag : List.of("enumeration", "bitfield")) {
             for (Element enumNode : childElements(ns, tag)) {
                 String cType = attr(enumNode, "c:type");
                 if (!cType.isEmpty()) {
@@ -465,22 +515,12 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
                 }
             }
         }
-
         for (Element alias : childElements(ns, "alias")) {
             String cType = attr(alias, "c:type");
             List<Element> typeNodes = childElements(alias, "type");
             if (!cType.isEmpty() && !typeNodes.isEmpty()) {
                 aliasTargets.put(cType, new String[] { attr(typeNodes.get(0), "name"), nsName });
             }
-        }
-
-        if (includeNamespaceFunctions.contains(nsName)) {
-            ClassDef def = new ClassDef();
-            def.name = nsName;
-            def.namespace = nsName;
-            def.cType = nsName;
-            def.isNamespaceClass = true;
-            classRegistry.put(NS_KEY_PREFIX + nsName, def);
         }
     }
 
@@ -738,163 +778,208 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
     }
 
     private MethodDef parseMethodNode(Element node, String nsName, String classCType, boolean isCtor, Set<String> targetKeys) {
-        if ("0".equals(attr(node, "introspectable"))) return null;
-
         String cId = attr(node, "c:identifier");
-        if (cId.isEmpty()) return null;
-
-        String girName = attr(node, "name");
-
-        String returnType;
-        boolean returnTransferFull = false;
-        int returnLengthIndex = -1;
-        if (isCtor) {
-            returnType = classCType;
-        } else {
-            List<Element> retValues = childElements(node, "return-value");
-            if (retValues.isEmpty()) return null;
-            returnType = resolveNodeType(retValues.get(0), nsName, targetKeys);
-            if (returnType == null) return null;
-            returnTransferFull = "full".equals(attr(retValues.get(0), "transfer-ownership"));
-            if ("byte[]".equals(returnType)) {
-                returnLengthIndex = Integer.parseInt(attr(childElements(retValues.get(0), "array").get(0), "length"));
-            }
+        if ("0".equals(attr(node, "introspectable")) || cId.isEmpty()) {
+            return null;
         }
-
-        List<ParamDef> params = new ArrayList<>();
-        boolean skip = false;
-
-        List<Element> paramContainers = childElements(node, "parameters");
-        if (!paramContainers.isEmpty()) {
-            for (Element param : childElements(paramContainers.get(0), "parameter")) {
-                if (skip) break;
-                if (!childElements(param, "varargs").isEmpty()) {
-                    skip = true;
-                    break;
-                }
-                String pName = attr(param, "name");
-                String pType = resolveNodeType(param, nsName, targetKeys);
-                if (pType == null) {
-                    skip = true;
-                    break;
-                }
-                ParamDef pd = new ParamDef();
-                pd.name = sanitizeJavaName(pName);
-                pd.type = pType;
-                String dir = attr(param, "direction");
-                pd.direction = dir.isEmpty() ? "in" : dir;
-                pd.transferFull = "full".equals(attr(param, "transfer-ownership"));
-                if (pType.endsWith("[]") && !childElements(param, "array").isEmpty()
-                        && !attr(childElements(param, "array").get(0), "length").isEmpty()) {
-                    if ("in".equals(pd.direction)) {
-                        pd.lengthIndex = Integer.parseInt(attr(childElements(param, "array").get(0), "length"));
-                    } else {
-                        pd.type = pType = "MemorySegment";
-                    }
-                }
-                if (!"in".equals(pd.direction)) {
-                    boolean callerAllocates = "1".equals(attr(param, "caller-allocates"));
-                    if (callerAllocates && isWrapperType(pType)) {
-                        // caller-allocated struct: the wrapper itself is the out pointer
-                    } else if (pType.equals("MemorySegment") || pType.endsWith("[]")) {
-                        // no typed representation, the caller passes the raw pointer
-                        pd.type = "MemorySegment";
-                    } else {
-                        // returned through a single-element holder array
-                        pd.holder = true;
-                        pd.elemType = pType;
-                        pd.type = pType + "[]";
-                    }
-                }
-                params.add(pd);
-            }
+        ReturnInfo ret = isCtor ? new ReturnInfo(classCType, false, -1) : parseReturn(node, nsName, targetKeys);
+        List<ParamDef> params = ret != null ? parseParams(node, nsName, targetKeys) : null;
+        if (params == null) {
+            return null;
         }
-
-        if (skip) return null;
-
-        // A returned byte[] takes its length from an out parameter
+        String returnType = ret.type();
         String returnLengthExpr = null;
-        if (returnLengthIndex >= 0) {
-            ParamDef length = returnLengthIndex < params.size() ? params.get(returnLengthIndex) : null;
-            if (length != null && length.holder && isPrimitiveJavaType(length.elemType)) {
-                length.implicitOut = true;
-                length.implicitValue = "_" + length.name;
-                returnLengthExpr = "_" + length.name + ".get(" + getValueLayout(length.elemType) + ", 0L)";
-            } else {
+        if (ret.lengthIndex() >= 0) {
+            returnLengthExpr = returnLengthFromOutParam(params, ret.lengthIndex());
+            if (returnLengthExpr == null) {
                 returnType = "MemorySegment";
             }
         }
-
-        // The length of a byte[] parameter is passed implicitly
-        for (ParamDef pd : params) {
-            if (pd.lengthIndex >= 0) {
-                if (pd.lengthIndex >= params.size() || !isPrimitiveJavaType(params.get(pd.lengthIndex).type)
-                        || params.get(pd.lengthIndex).holder) {
-                    pd.type = "byte[]".equals(pd.type) || isWrapperArray(pd.type) ? "MemorySegment" : pd.type;
-                    pd.lengthIndex = -1;
-                    continue;
-                }
-                ParamDef length = params.get(pd.lengthIndex);
-                String cast = "int".equals(length.type) ? "" : "(" + length.type + ") ";
-                length.implicitValue = "(" + pd.name + " != null ? " + cast + pd.name + ".length : 0)";
-            }
-        }
+        bindArrayLengths(params);
 
         MethodDef md = new MethodDef();
-        md.javaName = isCtor ? toCtorJavaName(girName) : toCamelCase(girName);
-        if (params.isEmpty() && OBJECT_METHODS.contains(md.javaName)) {
-            // would override or clash with a java.lang.Object method
-            md.javaName = md.javaName + "_";
-        }
+        md.javaName = javaMethodName(attr(node, "name"), isCtor, params.isEmpty());
         md.cIdentifier = cId;
         md.returnType = returnType;
         md.params = params;
         md.isStatic = isCtor;
         md.isCtor = isCtor;
-        md.returnTransferFull = returnTransferFull;
+        md.returnTransferFull = ret.transferFull();
         md.returnLengthExpr = returnLengthExpr;
         md.throwsError = "1".equals(attr(node, "throws"));
         return md;
     }
 
+    /** The return value of a function: its Java type, its ownership and, for a byte[], the index of its length. */
+    private record ReturnInfo(String type, boolean transferFull, int lengthIndex) {}
+
+    private ReturnInfo parseReturn(Element node, String nsName, Set<String> targetKeys) {
+        List<Element> retValues = childElements(node, "return-value");
+        if (retValues.isEmpty()) {
+            return null;
+        }
+        Element ret = retValues.get(0);
+        String type = resolveNodeType(ret, nsName, targetKeys);
+        if (type == null) {
+            return null;
+        }
+        int lengthIndex = "byte[]".equals(type)
+                ? Integer.parseInt(attr(childElements(ret, "array").get(0), "length")) : -1;
+        return new ReturnInfo(type, "full".equals(attr(ret, "transfer-ownership")), lengthIndex);
+    }
+
+    /** The parameters of a function, or null when one of them cannot be wrapped, as varargs. */
+    private List<ParamDef> parseParams(Element node, String nsName, Set<String> targetKeys) {
+        List<ParamDef> params = new ArrayList<>();
+        List<Element> paramContainers = childElements(node, "parameters");
+        if (paramContainers.isEmpty()) {
+            return params;
+        }
+        for (Element param : childElements(paramContainers.get(0), "parameter")) {
+            ParamDef pd = parseParam(param, nsName, targetKeys);
+            if (pd == null) {
+                return null;
+            }
+            params.add(pd);
+        }
+        return params;
+    }
+
+    private ParamDef parseParam(Element param, String nsName, Set<String> targetKeys) {
+        if (!childElements(param, "varargs").isEmpty()) {
+            return null;
+        }
+        String pType = resolveNodeType(param, nsName, targetKeys);
+        if (pType == null) {
+            return null;
+        }
+        ParamDef pd = new ParamDef();
+        pd.name = sanitizeJavaName(attr(param, "name"));
+        pd.type = pType;
+        String dir = attr(param, "direction");
+        pd.direction = dir.isEmpty() ? "in" : dir;
+        pd.transferFull = "full".equals(attr(param, "transfer-ownership"));
+        List<Element> arrays = childElements(param, "array");
+        if (pType.endsWith("[]") && !arrays.isEmpty() && !attr(arrays.get(0), "length").isEmpty()) {
+            if ("in".equals(pd.direction)) {
+                pd.lengthIndex = Integer.parseInt(attr(arrays.get(0), "length"));
+            } else {
+                pd.type = "MemorySegment";
+            }
+        }
+        if (!"in".equals(pd.direction)) {
+            applyOutDirection(pd, pd.type, "1".equals(attr(param, "caller-allocates")));
+        }
+        return pd;
+    }
+
+    /**
+     * How an out parameter is passed: a caller-allocated struct as its
+     * wrapper, which is the out pointer; a pointer or an array as a raw
+     * pointer; anything else through a single-element holder array.
+     */
+    private void applyOutDirection(ParamDef pd, String pType, boolean callerAllocates) {
+        if (callerAllocates && isWrapperType(pType)) {
+            return;
+        }
+        if (pType.equals("MemorySegment") || pType.endsWith("[]")) {
+            pd.type = "MemorySegment";
+        } else {
+            pd.holder = true;
+            pd.elemType = pType;
+            pd.type = pType + "[]";
+        }
+    }
+
+    /**
+     * A returned byte[] takes its length from an out parameter, which the
+     * wrapper allocates itself.
+     *
+     * @return the expression of the length, or null when the parameter cannot give it
+     */
+    private String returnLengthFromOutParam(List<ParamDef> params, int index) {
+        ParamDef length = index < params.size() ? params.get(index) : null;
+        if (length == null || !length.holder || !isPrimitiveJavaType(length.elemType)) {
+            return null;
+        }
+        length.implicitOut = true;
+        length.implicitValue = "_" + length.name;
+        return "_" + length.name + ".get(" + getValueLayout(length.elemType) + ", 0L)";
+    }
+
+    /** The length of an array parameter is passed implicitly, when it is a primitive in parameter. */
+    private void bindArrayLengths(List<ParamDef> params) {
+        for (ParamDef pd : params) {
+            if (pd.lengthIndex < 0) {
+                continue;
+            }
+            ParamDef length = pd.lengthIndex < params.size() ? params.get(pd.lengthIndex) : null;
+            if (length == null || !isPrimitiveJavaType(length.type) || length.holder) {
+                pd.type = "byte[]".equals(pd.type) || isWrapperArray(pd.type) ? "MemorySegment" : pd.type;
+                pd.lengthIndex = -1;
+                continue;
+            }
+            String cast = "int".equals(length.type) ? "" : "(" + length.type + ") ";
+            length.implicitValue = "(" + pd.name + " != null ? " + cast + pd.name + ".length : 0)";
+        }
+    }
+
+    /** The Java name of a function; one without parameters that would clash with a method of Object gets a _. */
+    private String javaMethodName(String girName, boolean isCtor, boolean noParams) {
+        String name = isCtor ? toCtorJavaName(girName) : toCamelCase(girName);
+        return noParams && OBJECT_METHODS.contains(name) ? name + "_" : name;
+    }
+
     private String resolveNodeType(Element node, String nsName, Set<String> targetKeys) {
         List<Element> arrays = childElements(node, "array");
         if (!arrays.isEmpty()) {
-            Element array = arrays.get(0);
-            List<Element> elemTypes = childElements(array, "type");
-            String elemName = elemTypes.isEmpty() ? "" : attr(elemTypes.get(0), "name");
-            String zt = attr(array, "zero-terminated");
-            boolean hasLength = !attr(array, "length").isEmpty();
-            boolean zeroTerminated = "1".equals(zt)
-                || (zt.isEmpty() && !hasLength && attr(array, "fixed-size").isEmpty());
-            if (zeroTerminated && ("utf8".equals(elemName) || "filename".equals(elemName))) {
-                return "String[]";
-            }
-            if (hasLength && ("guint8".equals(elemName) || "gint8".equals(elemName) || "gchar".equals(elemName))) {
-                return "byte[]";
-            }
-            if (hasLength && !elemName.isEmpty() && !PRIMITIVE_TYPE_MAP.containsKey(elemName)) {
-                // An array of objects, passed as an array of pointers
-                String elemCType = girNameToCType(elemName, nsName);
-                ClassDef elem = elemCType != null ? classRegistry.get(elemCType) : null;
-                if (elem != null && !elem.isStructRecord && generatedTypes.contains(elemCType)) {
-                    return elemCType + "[]";
-                }
-            }
+            return arrayType(arrays.get(0), nsName);
+        }
+        List<Element> typeNodes = childElements(node, "type");
+        String typeName = typeNodes.isEmpty() ? "" : attr(typeNodes.get(0), "name");
+        if (typeName.isEmpty()) {
             return "MemorySegment";
         }
-
-        List<Element> typeNodes = childElements(node, "type");
-        if (typeNodes.isEmpty()) return "MemorySegment";
-
-        String typeName = attr(typeNodes.get(0), "name");
-        if (typeName.isEmpty()) return "MemorySegment";
-
         if (PRIMITIVE_TYPE_MAP.containsKey(typeName)) {
             return PRIMITIVE_TYPE_MAP.get(typeName);
         }
+        return namedType(girNameToCType(typeName, nsName), targetKeys);
+    }
 
-        String cTypeName = girNameToCType(typeName, nsName);
+    /**
+     * The Java type of an array: String[] for a zero-terminated array of
+     * strings, byte[] for bytes with a length, an array of wrappers for
+     * objects with a length, and a raw pointer otherwise.
+     */
+    private String arrayType(Element array, String nsName) {
+        List<Element> elemTypes = childElements(array, "type");
+        String elemName = elemTypes.isEmpty() ? "" : attr(elemTypes.get(0), "name");
+        String zt = attr(array, "zero-terminated");
+        boolean hasLength = !attr(array, "length").isEmpty();
+        boolean zeroTerminated = "1".equals(zt) || (zt.isEmpty() && !hasLength && attr(array, "fixed-size").isEmpty());
+        if (zeroTerminated && ("utf8".equals(elemName) || "filename".equals(elemName))) {
+            return "String[]";
+        }
+        if (hasLength && ("guint8".equals(elemName) || "gint8".equals(elemName) || "gchar".equals(elemName))) {
+            return "byte[]";
+        }
+        if (hasLength && !elemName.isEmpty() && !PRIMITIVE_TYPE_MAP.containsKey(elemName)) {
+            // An array of objects, passed as an array of pointers
+            String elemCType = girNameToCType(elemName, nsName);
+            ClassDef elem = elemCType != null ? classRegistry.get(elemCType) : null;
+            if (elem != null && !elem.isStructRecord && generatedTypes.contains(elemCType)) {
+                return elemCType + "[]";
+            }
+        }
+        return "MemorySegment";
+    }
+
+    /**
+     * The Java type of a named C type, following aliases: a primitive, int
+     * for an enumeration, the nearest generated wrapper of a class, or a raw
+     * pointer.
+     */
+    private String namedType(String cTypeName, Set<String> targetKeys) {
         for (int depth = 0; cTypeName != null && aliasTargets.containsKey(cTypeName) && depth < 8; depth++) {
             String[] target = aliasTargets.get(cTypeName);
             if (PRIMITIVE_TYPE_MAP.containsKey(target[0])) {
@@ -902,13 +987,15 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
             }
             cTypeName = girNameToCType(target[0], target[1]);
         }
-        if (cTypeName != null) {
-            if (enumCTypes.contains(cTypeName)) return "int";
-            if (classRegistry.containsKey(cTypeName)) {
-                return nearestGeneratedType(cTypeName, targetKeys, new HashSet<>());
-            }
+        if (cTypeName == null) {
+            return "MemorySegment";
         }
-
+        if (enumCTypes.contains(cTypeName)) {
+            return "int";
+        }
+        if (classRegistry.containsKey(cTypeName)) {
+            return nearestGeneratedType(cTypeName, targetKeys, new HashSet<>());
+        }
         return "MemorySegment";
     }
 
@@ -991,18 +1078,35 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
         List<MethodDef> allMethods = new ArrayList<>();
         allMethods.addAll(classDef.constructors);
         allMethods.addAll(classDef.methods);
-
         ClassDef parentDef = generatedParent(classDef);
         String parentClass = parentDef != null ? parentDef.cType : null;
-
-        StringBuilder sb = new StringBuilder();
         String className = classDef.cType;
 
+        StringBuilder sb = new StringBuilder();
         sb.append(LICENSE).append(GENERATED);
         sb.append("package ").append(packageName).append(";\n\n");
         appendImports(sb, allMethods, classDef, parentClass == null);
+        appendClassDeclaration(sb, classDef, parentClass);
+        if (parentClass != null) {
+            sb.append(SUBCLASS_CONSTRUCTOR.formatted(className));
+        } else {
+            sb.append(ROOT_MEMBERS.formatted(className, className));
+            if ("GObject".equals(className)) {
+                sb.append(GOBJECT_PROPERTIES);
+            }
+        }
+        appendTypeMethods(sb, classDef, "public static ");
+        for (MethodDef method : allMethods) {
+            sb.append("\n").append(generateMethod(method));
+        }
+        appendHandles(sb, classDef, allMethods, "private static final class H");
+        sb.append("}\n");
+        return sb.toString();
+    }
 
-        sb.append("public class ").append(className);
+    /** The class declaration, with its generated parent and the interfaces it implements. */
+    private void appendClassDeclaration(StringBuilder sb, ClassDef classDef, String parentClass) {
+        sb.append("public class ").append(classDef.cType);
         if (parentClass != null) {
             sb.append(" extends ").append(parentClass);
         }
@@ -1011,168 +1115,167 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
             sb.append(" implements ").append(String.join(", ", interfaces));
         }
         sb.append(" {\n");
-
-        if (parentClass == null) {
-            sb.append("\n    protected final MemorySegment ptr;\n");
-            sb.append("\n    public ").append(className).append("(MemorySegment ptr) {\n");
-            sb.append("        this.ptr = ptr;\n");
-            sb.append("    }\n");
-            sb.append("\n    public MemorySegment getPointer() {\n");
-            sb.append("        return ptr;\n");
-            sb.append("    }\n");
-            sb.append("\n    public boolean isNull() {\n");
-            sb.append("        return ptr == null || ptr.address() == 0;\n");
-            sb.append("    }\n");
-            sb.append("\n    public <T> T cast(Function<MemorySegment, T> wrapper) {\n");
-            sb.append("        return wrapper.apply(ptr);\n");
-            sb.append("    }\n");
-            sb.append("\n    @Override\n");
-            sb.append("    public boolean equals(Object obj) {\n");
-            sb.append("        return obj instanceof ").append(className).append(" other\n");
-            sb.append("            && (ptr == null ? 0 : ptr.address()) == (other.ptr == null ? 0 : other.ptr.address());\n");
-            sb.append("    }\n");
-            sb.append("\n    @Override\n");
-            sb.append("    public int hashCode() {\n");
-            sb.append("        return Long.hashCode(ptr == null ? 0 : ptr.address());\n");
-            sb.append("    }\n");
-            if ("GObject".equals(classDef.cType)) {
-                sb.append("\n    private static final long G_TYPE_INT = 24L;\n");
-                sb.append("    private static final long G_TYPE_BOOLEAN = 20L;\n");
-                sb.append("    private static final long G_TYPE_STRING = 64L;\n");
-                sb.append("    private static final long GVALUE_SIZE = 24L;\n");
-                sb.append("\n    public int getIntProperty(String name) {\n");
-                sb.append("        try (Arena arena = Arena.ofConfined()) {\n");
-                sb.append("            MemorySegment gval = arena.allocate(GVALUE_SIZE);\n");
-                sb.append("            valueInit(gval, G_TYPE_INT);\n");
-                sb.append("            getProperty(ptr, arena.allocateFrom(name), gval);\n");
-                sb.append("            return gval.get(ValueLayout.JAVA_INT, 8L);\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    public boolean getBooleanProperty(String name) {\n");
-                sb.append("        try (Arena arena = Arena.ofConfined()) {\n");
-                sb.append("            MemorySegment gval = arena.allocate(GVALUE_SIZE);\n");
-                sb.append("            valueInit(gval, G_TYPE_BOOLEAN);\n");
-                sb.append("            getProperty(ptr, arena.allocateFrom(name), gval);\n");
-                sb.append("            return gval.get(ValueLayout.JAVA_INT, 8L) != 0;\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    public String getStringProperty(String name) {\n");
-                sb.append("        try (Arena arena = Arena.ofConfined()) {\n");
-                sb.append("            MemorySegment gval = arena.allocate(GVALUE_SIZE);\n");
-                sb.append("            valueInit(gval, G_TYPE_STRING);\n");
-                sb.append("            getProperty(ptr, arena.allocateFrom(name), gval);\n");
-                sb.append("            MemorySegment str = gval.get(ValueLayout.ADDRESS, 8L);\n");
-                sb.append("            String result = str.address() == 0 ? null : readString(str);\n");
-                sb.append("            valueUnset(gval);\n");
-                sb.append("            return result;\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    public void setBooleanProperty(String name, boolean value) {\n");
-                sb.append("        try (Arena arena = Arena.ofConfined()) {\n");
-                sb.append("            MemorySegment gval = arena.allocate(GVALUE_SIZE);\n");
-                sb.append("            valueInit(gval, G_TYPE_BOOLEAN);\n");
-                sb.append("            gval.set(ValueLayout.JAVA_INT, 8L, value ? 1 : 0);\n");
-                sb.append("            setProperty(ptr, arena.allocateFrom(name), gval);\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    /**\n");
-                sb.append("     * Whether the object's class installs a property with the given name.\n");
-                sb.append("     */\n");
-                sb.append("    public boolean hasProperty(String name) {\n");
-                sb.append("        try (Arena arena = Arena.ofConfined()) {\n");
-                sb.append("            // G_OBJECT_GET_CLASS: the class pointer is the first member of the instance\n");
-                sb.append("            MemorySegment klass = ptr.reinterpret(ValueLayout.ADDRESS.byteSize()).get(ValueLayout.ADDRESS, 0L);\n");
-                sb.append("            try {\n");
-                sb.append("                return ((MemorySegment) HP.FIND_PROPERTY.get().invokeExact(klass, arena.allocateFrom(name))).address() != 0;\n");
-                sb.append("            } catch (Throwable _t) {\n");
-                sb.append("                throw rethrow(_t);\n");
-                sb.append("            }\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    private static void valueInit(MemorySegment gval, long type) {\n");
-                sb.append("        try {\n");
-                sb.append("            MemorySegment _r = (MemorySegment) HP.VALUE_INIT.get().invokeExact(gval, type);\n");
-                sb.append("        } catch (Throwable _t) {\n");
-                sb.append("            throw rethrow(_t);\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    private static void valueUnset(MemorySegment gval) {\n");
-                sb.append("        try {\n");
-                sb.append("            HP.VALUE_UNSET.get().invokeExact(gval);\n");
-                sb.append("        } catch (Throwable _t) {\n");
-                sb.append("            throw rethrow(_t);\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    private static void getProperty(MemorySegment object, MemorySegment name, MemorySegment gval) {\n");
-                sb.append("        try {\n");
-                sb.append("            HP.GET_PROPERTY.get().invokeExact(object, name, gval);\n");
-                sb.append("        } catch (Throwable _t) {\n");
-                sb.append("            throw rethrow(_t);\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    private static void setProperty(MemorySegment object, MemorySegment name, MemorySegment gval) {\n");
-                sb.append("        try {\n");
-                sb.append("            HP.SET_PROPERTY.get().invokeExact(object, name, gval);\n");
-                sb.append("        } catch (Throwable _t) {\n");
-                sb.append("            throw rethrow(_t);\n");
-                sb.append("        }\n");
-                sb.append("    }\n");
-                sb.append("\n    private static final class HP {\n");
-                sb.append("        static final LazyHandle VALUE_INIT = new LazyHandle(\"g_value_init\",\n");
-                sb.append("                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));\n");
-                sb.append("        static final LazyHandle VALUE_UNSET = new LazyHandle(\"g_value_unset\",\n");
-                sb.append("                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));\n");
-                sb.append("        static final LazyHandle GET_PROPERTY = new LazyHandle(\"g_object_get_property\",\n");
-                sb.append("                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));\n");
-                sb.append("        static final LazyHandle SET_PROPERTY = new LazyHandle(\"g_object_set_property\",\n");
-                sb.append("                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));\n");
-                sb.append("        static final LazyHandle FIND_PROPERTY = new LazyHandle(\"g_object_class_find_property\",\n");
-                sb.append("                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));\n");
-                sb.append("    }\n");
-            }
-        } else {
-            sb.append("\n    public ").append(className).append("(MemorySegment ptr) {\n");
-            sb.append("        super(ptr);\n");
-            sb.append("    }\n");
-        }
-
-        appendTypeMethods(sb, classDef, "public static ");
-
-        for (MethodDef method : allMethods) {
-            sb.append("\n").append(generateMethod(method));
-        }
-
-        appendHandles(sb, classDef, allMethods, "private static final class H");
-
-        sb.append("}\n");
-        return sb.toString();
     }
+
+    /** The constructor of a class whose parent holds the pointer. */
+    private static final String SUBCLASS_CONSTRUCTOR = """
+
+                public %s(MemorySegment ptr) {
+                    super(ptr);
+                }
+            """;
+
+    /** The pointer of a root class, its accessors, equals and hashCode; %s is the class name. */
+    private static final String ROOT_MEMBERS = """
+
+                protected final MemorySegment ptr;
+
+                public %s(MemorySegment ptr) {
+                    this.ptr = ptr;
+                }
+
+                public MemorySegment getPointer() {
+                    return ptr;
+                }
+
+                public boolean isNull() {
+                    return ptr == null || ptr.address() == 0;
+                }
+
+                public <T> T cast(Function<MemorySegment, T> wrapper) {
+                    return wrapper.apply(ptr);
+                }
+
+                @Override
+                public boolean equals(Object obj) {
+                    return obj instanceof %s other
+                        && (ptr == null ? 0 : ptr.address()) == (other.ptr == null ? 0 : other.ptr.address());
+                }
+
+                @Override
+                public int hashCode() {
+                    return Long.hashCode(ptr == null ? 0 : ptr.address());
+                }
+            """;
+
+    /** The property accessors of GObject, through GValues. */
+    private static final String GOBJECT_PROPERTIES = """
+
+                private static final long G_TYPE_INT = 24L;
+                private static final long G_TYPE_BOOLEAN = 20L;
+                private static final long G_TYPE_STRING = 64L;
+                private static final long GVALUE_SIZE = 24L;
+
+                public int getIntProperty(String name) {
+                    try (Arena arena = Arena.ofConfined()) {
+                        MemorySegment gval = arena.allocate(GVALUE_SIZE);
+                        valueInit(gval, G_TYPE_INT);
+                        getProperty(ptr, arena.allocateFrom(name), gval);
+                        return gval.get(ValueLayout.JAVA_INT, 8L);
+                    }
+                }
+
+                public boolean getBooleanProperty(String name) {
+                    try (Arena arena = Arena.ofConfined()) {
+                        MemorySegment gval = arena.allocate(GVALUE_SIZE);
+                        valueInit(gval, G_TYPE_BOOLEAN);
+                        getProperty(ptr, arena.allocateFrom(name), gval);
+                        return gval.get(ValueLayout.JAVA_INT, 8L) != 0;
+                    }
+                }
+
+                public String getStringProperty(String name) {
+                    try (Arena arena = Arena.ofConfined()) {
+                        MemorySegment gval = arena.allocate(GVALUE_SIZE);
+                        valueInit(gval, G_TYPE_STRING);
+                        getProperty(ptr, arena.allocateFrom(name), gval);
+                        MemorySegment str = gval.get(ValueLayout.ADDRESS, 8L);
+                        String result = str.address() == 0 ? null : readString(str);
+                        valueUnset(gval);
+                        return result;
+                    }
+                }
+
+                public void setBooleanProperty(String name, boolean value) {
+                    try (Arena arena = Arena.ofConfined()) {
+                        MemorySegment gval = arena.allocate(GVALUE_SIZE);
+                        valueInit(gval, G_TYPE_BOOLEAN);
+                        gval.set(ValueLayout.JAVA_INT, 8L, value ? 1 : 0);
+                        setProperty(ptr, arena.allocateFrom(name), gval);
+                    }
+                }
+
+                /**
+                 * Whether the object's class installs a property with the given name.
+                 */
+                public boolean hasProperty(String name) {
+                    try (Arena arena = Arena.ofConfined()) {
+                        // G_OBJECT_GET_CLASS: the class pointer is the first member of the instance
+                        MemorySegment klass = ptr.reinterpret(ValueLayout.ADDRESS.byteSize()).get(ValueLayout.ADDRESS, 0L);
+                        try {
+                            return ((MemorySegment) HP.FIND_PROPERTY.get().invokeExact(klass, arena.allocateFrom(name))).address() != 0;
+                        } catch (Throwable _t) {
+                            throw rethrow(_t);
+                        }
+                    }
+                }
+
+                private static void valueInit(MemorySegment gval, long type) {
+                    try {
+                        MemorySegment _r = (MemorySegment) HP.VALUE_INIT.get().invokeExact(gval, type);
+                    } catch (Throwable _t) {
+                        throw rethrow(_t);
+                    }
+                }
+
+                private static void valueUnset(MemorySegment gval) {
+                    try {
+                        HP.VALUE_UNSET.get().invokeExact(gval);
+                    } catch (Throwable _t) {
+                        throw rethrow(_t);
+                    }
+                }
+
+                private static void getProperty(MemorySegment object, MemorySegment name, MemorySegment gval) {
+                    try {
+                        HP.GET_PROPERTY.get().invokeExact(object, name, gval);
+                    } catch (Throwable _t) {
+                        throw rethrow(_t);
+                    }
+                }
+
+                private static void setProperty(MemorySegment object, MemorySegment name, MemorySegment gval) {
+                    try {
+                        HP.SET_PROPERTY.get().invokeExact(object, name, gval);
+                    } catch (Throwable _t) {
+                        throw rethrow(_t);
+                    }
+                }
+
+                private static final class HP {
+                    static final LazyHandle VALUE_INIT = new LazyHandle("g_value_init",
+                            FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+                    static final LazyHandle VALUE_UNSET = new LazyHandle("g_value_unset",
+                            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+                    static final LazyHandle GET_PROPERTY = new LazyHandle("g_object_get_property",
+                            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    static final LazyHandle SET_PROPERTY = new LazyHandle("g_object_set_property",
+                            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    static final LazyHandle FIND_PROPERTY = new LazyHandle("g_object_class_find_property",
+                            FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                }
+            """;
 
     private String generateInterfaceSource(ClassDef classDef) {
         List<MethodDef> allMethods = new ArrayList<>();
         allMethods.addAll(classDef.constructors);
         allMethods.addAll(classDef.methods);
-        String className = classDef.cType;
-
         StringBuilder sb = new StringBuilder();
         sb.append(LICENSE).append(GENERATED);
         sb.append("package ").append(packageName).append(";\n\n");
         appendImports(sb, allMethods, classDef, true);
-
-        sb.append("public interface ").append(className).append(" {\n");
-        sb.append("\n    MemorySegment getPointer();\n");
-        sb.append("\n    static ").append(className).append(" wrap(MemorySegment ptr) {\n");
-        sb.append("        return () -> ptr;\n");
-        sb.append("    }\n");
-        sb.append("\n    default boolean isNull() {\n");
-        sb.append("        return getPointer() == null || getPointer().address() == 0;\n");
-        sb.append("    }\n");
-        sb.append("\n    default <T> T cast(Function<MemorySegment, T> wrapper) {\n");
-        sb.append("        return wrapper.apply(getPointer());\n");
-        sb.append("    }\n");
-
+        sb.append(INTERFACE_START.formatted(classDef.cType, classDef.cType));
         appendTypeMethods(sb, classDef, "static ");
-
         generatingInterface = true;
         try {
             for (MethodDef method : allMethods) {
@@ -1181,12 +1284,29 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
         } finally {
             generatingInterface = false;
         }
-
         appendHandles(sb, classDef, allMethods, "final class H");
-
         sb.append("}\n");
         return sb.toString();
     }
+
+    /** The declaration of an interface, its pointer, wrap, isNull and cast; %s is the interface name. */
+    private static final String INTERFACE_START = """
+            public interface %s {
+
+                MemorySegment getPointer();
+
+                static %s wrap(MemorySegment ptr) {
+                    return () -> ptr;
+                }
+
+                default boolean isNull() {
+                    return getPointer() == null || getPointer().address() == 0;
+                }
+
+                default <T> T cast(Function<MemorySegment, T> wrapper) {
+                    return wrapper.apply(getPointer());
+                }
+            """;
 
     private void appendImports(StringBuilder sb, List<MethodDef> allMethods, ClassDef classDef, boolean root) {
         boolean isGObject = "GObject".equals(classDef.cType);
@@ -1259,42 +1379,59 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
         Map<String, String> classSigs = new HashMap<>();
         // signatures of default methods from interfaces implemented by this class or its ancestors
         Map<String, String> defaultSigs = new HashMap<>();
-        for (MethodDef m : classDef.methods) {
-            if (!m.isStatic) classSigs.put(signature(m), m.returnType);
-        }
+        addSignatures(classSigs, classDef.methods, false);
         for (ClassDef parent = generatedParent(classDef); parent != null; parent = generatedParent(parent)) {
-            for (MethodDef m : parent.methods) {
-                if (!m.isStatic) classSigs.putIfAbsent(signature(m), m.returnType);
-            }
+            addSignatures(classSigs, parent.methods, true);
             for (String iface : acceptedInterfaces(parent)) {
                 inherited.add(iface);
-                for (MethodDef m : classRegistry.get(iface).methods) {
-                    if (!m.isStatic) defaultSigs.put(signature(m), m.returnType);
-                }
+                addSignatures(defaultSigs, classRegistry.get(iface).methods, false);
             }
         }
         for (String ifaceCType : classDef.implementsCTypes) {
             ClassDef iface = classRegistry.get(ifaceCType);
-            if (iface == null || !iface.isInterface || !generatedTypes.contains(ifaceCType)) continue;
-            if (inherited.contains(ifaceCType)) continue;
-            boolean compatible = true;
-            for (MethodDef m : iface.methods) {
-                if (m.isStatic) continue;
-                String sig = signature(m);
-                String classReturn = classSigs.get(sig);
-                if (classReturn != null ? !classReturn.equals(m.returnType) : defaultSigs.containsKey(sig)) {
-                    compatible = false;
-                    break;
-                }
+            if (iface == null || !iface.isInterface || !generatedTypes.contains(ifaceCType)
+                    || inherited.contains(ifaceCType)) {
+                continue;
             }
-            if (compatible) {
+            if (isCompatible(iface, classSigs, defaultSigs)) {
                 accepted.add(ifaceCType);
-                for (MethodDef m : iface.methods) {
-                    if (!m.isStatic) defaultSigs.put(signature(m), m.returnType);
-                }
+                addSignatures(defaultSigs, iface.methods, false);
             }
         }
         return accepted;
+    }
+
+    /** The signatures and return types of the instance methods; ifAbsent keeps those already there. */
+    private void addSignatures(Map<String, String> signatures, List<MethodDef> methods, boolean ifAbsent) {
+        for (MethodDef m : methods) {
+            if (m.isStatic) {
+                continue;
+            }
+            if (ifAbsent) {
+                signatures.putIfAbsent(signature(m), m.returnType);
+            } else {
+                signatures.put(signature(m), m.returnType);
+            }
+        }
+    }
+
+    /**
+     * Whether an interface can be implemented: none of its default methods
+     * clashes with a method of the class of another return type, or with a
+     * default method of another interface.
+     */
+    private boolean isCompatible(ClassDef iface, Map<String, String> classSigs, Map<String, String> defaultSigs) {
+        for (MethodDef m : iface.methods) {
+            if (m.isStatic) {
+                continue;
+            }
+            String sig = signature(m);
+            String classReturn = classSigs.get(sig);
+            if (classReturn != null ? !classReturn.equals(m.returnType) : defaultSigs.containsKey(sig)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1323,100 +1460,117 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
         List<MethodDef> allMethods = new ArrayList<>();
         allMethods.addAll(classDef.constructors);
         allMethods.addAll(classDef.methods);
-        boolean hasHandles = !allMethods.isEmpty() || !classDef.getTypeFunc.isEmpty();
         String className = classDef.cType;
 
         StringBuilder sb = new StringBuilder();
         sb.append(LICENSE).append(GENERATED);
         sb.append("package ").append(packageName).append(";\n\n");
+        appendStructImports(sb, classDef, allMethods, !accessors.isEmpty());
+        sb.append("public final class ").append(className).append(" {\n");
+        appendStructLayout(sb, fields, accessors);
+        sb.append("\n    private final MemorySegment seg;\n");
+        String ctorParams = accessors.stream()
+            .map(f -> f.type + " " + sanitizeJavaName(f.name))
+            .collect(Collectors.joining(", "));
+        if (plain) {
+            sb.append("\n    public ").append(className).append("(").append(ctorParams).append(") {\n");
+            sb.append("        this.seg = Arena.ofAuto().allocate(LAYOUT);\n");
+            appendFieldSets(sb, accessors, "this.seg");
+            sb.append("    }\n");
+        }
+        sb.append(STRUCT_MEMBERS.formatted(className, className, className));
+        if (plain) {
+            sb.append("\n    public static MemorySegment allocate(Arena arena, ").append(ctorParams).append(") {\n");
+            sb.append("        MemorySegment s = arena.allocate(LAYOUT);\n");
+            appendFieldSets(sb, accessors, "s");
+            sb.append("        return s;\n");
+            sb.append("    }\n");
+        }
+        for (FieldDef f : accessors) {
+            appendFieldAccessors(sb, f);
+        }
+        appendTypeMethods(sb, classDef, "public static ");
+        appendStructMethods(sb, allMethods);
+        appendHandles(sb, classDef, allMethods, "private static final class H");
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    /** The constructor from a segment, create, segment and layout of a structure; %s is the class name. */
+    private static final String STRUCT_MEMBERS = """
+
+                public %s(MemorySegment seg) {
+                    this.seg = seg.byteSize() < LAYOUT.byteSize() ? seg.reinterpret(LAYOUT.byteSize()) : seg;
+                }
+
+                public static %s create(Arena arena) {
+                    return new %s(arena.allocate(LAYOUT));
+                }
+
+                public MemorySegment segment() {
+                    return seg;
+                }
+
+                public static MemoryLayout layout() {
+                    return LAYOUT;
+                }
+            """;
+
+    private void appendStructImports(StringBuilder sb, ClassDef classDef, List<MethodDef> allMethods,
+                                     boolean hasAccessors) {
+        boolean hasHandles = !allMethods.isEmpty() || !classDef.getTypeFunc.isEmpty();
         sb.append("import java.lang.foreign.Arena;\n");
         if (hasHandles) sb.append("import java.lang.foreign.FunctionDescriptor;\n");
         sb.append("import java.lang.foreign.MemoryLayout;\n");
         sb.append("import java.lang.foreign.MemorySegment;\n");
         sb.append("import java.lang.foreign.ValueLayout;\n");
-        if (!accessors.isEmpty()) sb.append("import java.lang.invoke.VarHandle;\n");
+        if (hasAccessors) sb.append("import java.lang.invoke.VarHandle;\n");
         sb.append("\n");
         Set<String> invokeImports = collectInvokeImports(allMethods);
         if (!classDef.getTypeFunc.isEmpty()) {
             invokeImports.add("rethrow");
             invokeImports.add("isSymbolAvailable");
         }
-        List<String> sortedImports = new ArrayList<>(invokeImports);
-        Collections.sort(sortedImports);
-        for (String imp : sortedImports) {
+        for (String imp : invokeImports.stream().sorted().toList()) {
             sb.append("import static ").append(packageName).append(".NativeSymbolLookup.").append(imp).append(";\n");
         }
         if (!invokeImports.isEmpty()) sb.append("\n");
+    }
 
-        sb.append("public final class ").append(className).append(" {\n");
-        long[] sizeAndAlign = new long[2];
-        List<String> members = structMembers(fields, sizeAndAlign);
+    /** The layout of the structure and a var handle for each field with an accessor. */
+    private void appendStructLayout(StringBuilder sb, List<FieldDef> fields, List<FieldDef> accessors) {
+        List<String> members = structMembers(fields, new long[2]);
         sb.append("\n    private static final MemoryLayout LAYOUT = MemoryLayout.structLayout(\n");
         for (int i = 0; i < members.size(); i++) {
             sb.append("            ").append(members.get(i)).append(i < members.size() - 1 ? "," : "").append("\n");
         }
         sb.append("    );\n\n");
-
         for (FieldDef f : accessors) {
             sb.append("    private static final VarHandle ").append(handleName(f))
               .append(" = LAYOUT.varHandle(MemoryLayout.PathElement.groupElement(\"").append(f.name).append("\"));\n");
         }
+    }
 
-        sb.append("\n    private final MemorySegment seg;\n");
-
-        String ctorParams = accessors.stream()
-            .map(f -> f.type + " " + sanitizeJavaName(f.name))
-            .collect(Collectors.joining(", "));
-
-        if (plain) {
-            sb.append("\n    public ").append(className).append("(").append(ctorParams).append(") {\n");
-            sb.append("        this.seg = Arena.ofAuto().allocate(LAYOUT);\n");
-            for (FieldDef f : accessors) {
-                sb.append("        ").append(handleName(f)).append(".set(this.seg, 0L, ")
-                  .append(sanitizeJavaName(f.name)).append(");\n");
-            }
-            sb.append("    }\n");
-        }
-
-        sb.append("\n    public ").append(className).append("(MemorySegment seg) {\n");
-        sb.append("        this.seg = seg.byteSize() < LAYOUT.byteSize() ? seg.reinterpret(LAYOUT.byteSize()) : seg;\n");
-        sb.append("    }\n");
-
-        sb.append("\n    public static ").append(className).append(" create(Arena arena) {\n");
-        sb.append("        return new ").append(className).append("(arena.allocate(LAYOUT));\n");
-        sb.append("    }\n");
-
-        sb.append("\n    public MemorySegment segment() {\n");
-        sb.append("        return seg;\n");
-        sb.append("    }\n");
-
-        sb.append("\n    public static MemoryLayout layout() {\n");
-        sb.append("        return LAYOUT;\n");
-        sb.append("    }\n");
-
-        if (plain) {
-            sb.append("\n    public static MemorySegment allocate(Arena arena, ").append(ctorParams).append(") {\n");
-            sb.append("        MemorySegment s = arena.allocate(LAYOUT);\n");
-            for (FieldDef f : accessors) {
-                sb.append("        ").append(handleName(f)).append(".set(s, 0L, ")
-                  .append(sanitizeJavaName(f.name)).append(");\n");
-            }
-            sb.append("        return s;\n");
-            sb.append("    }\n");
-        }
-
+    /** Sets each field of a segment from the parameter of the same name. */
+    private void appendFieldSets(StringBuilder sb, List<FieldDef> accessors, String segment) {
         for (FieldDef f : accessors) {
-            String jName = accessorName(f);
-            sb.append("\n    public ").append(f.type).append(" ").append(jName).append("() {\n");
-            sb.append("        return (").append(f.type).append(") ").append(handleName(f)).append(".get(seg, 0L);\n");
-            sb.append("    }\n");
-            sb.append("\n    public void ").append(jName).append("(").append(f.type).append(" value) {\n");
-            sb.append("        ").append(handleName(f)).append(".set(seg, 0L, value);\n");
-            sb.append("    }\n");
+            sb.append("        ").append(handleName(f)).append(".set(").append(segment).append(", 0L, ")
+              .append(sanitizeJavaName(f.name)).append(");\n");
         }
+    }
 
-        appendTypeMethods(sb, classDef, "public static ");
+    private void appendFieldAccessors(StringBuilder sb, FieldDef f) {
+        String jName = accessorName(f);
+        sb.append("\n    public ").append(f.type).append(" ").append(jName).append("() {\n");
+        sb.append("        return (").append(f.type).append(") ").append(handleName(f)).append(".get(seg, 0L);\n");
+        sb.append("    }\n");
+        sb.append("\n    public void ").append(jName).append("(").append(f.type).append(" value) {\n");
+        sb.append("        ").append(handleName(f)).append(".set(seg, 0L, value);\n");
+        sb.append("    }\n");
+    }
 
+    /** The methods of a structure, whose instance is its segment. */
+    private void appendStructMethods(StringBuilder sb, List<MethodDef> allMethods) {
         generatingStruct = true;
         try {
             for (MethodDef method : allMethods) {
@@ -1425,11 +1579,6 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
         } finally {
             generatingStruct = false;
         }
-
-        appendHandles(sb, classDef, allMethods, "private static final class H");
-
-        sb.append("}\n");
-        return sb.toString();
     }
 
     private static String handleName(FieldDef f) {
@@ -1445,40 +1594,20 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
     private String generateNamespaceFunctionSource(ClassDef classDef) {
         List<MethodDef> allMethods = classDef.methods;
         String className = classDef.name;
-
-        boolean needsArena = allMethods.stream().anyMatch(Gtk4WrapperGeneratorTask::isNeedsArena);
         boolean hasMethods = !allMethods.isEmpty();
-        Set<String> invokeImports = collectInvokeImports(allMethods);
-
         StringBuilder sb = new StringBuilder();
         sb.append(LICENSE).append(GENERATED);
         sb.append("package ").append(packageName).append(";\n\n");
-
-        if (needsArena) sb.append("import java.lang.foreign.Arena;\n");
-        if (hasMethods) sb.append("import java.lang.foreign.FunctionDescriptor;\n");
-        sb.append("import java.lang.foreign.MemorySegment;\n");
-        if (hasMethods) sb.append("import java.lang.foreign.ValueLayout;\n");
-        if (hasMethods) sb.append("\n");
-
-        List<String> sortedImports = new ArrayList<>(invokeImports);
-        Collections.sort(sortedImports);
-        for (String imp : sortedImports) {
-            sb.append("import static ").append(packageName).append(".NativeSymbolLookup.").append(imp).append(";\n");
-        }
-        if (!invokeImports.isEmpty()) sb.append("\n");
-
+        appendNamespaceImports(sb, allMethods);
         sb.append("public final class ").append(className).append(" {\n");
         sb.append("\n    private ").append(className).append("() {}\n");
-
         for (ConstDef c : classDef.constants) {
             sb.append("\n    public static final ").append(c.type).append(" ").append(c.name)
               .append(" = ").append(c.value).append(";\n");
         }
-
         for (MethodDef method : allMethods) {
             sb.append("\n").append(generateMethod(method));
         }
-
         if (hasMethods) {
             sb.append("\n    private static final class H {\n");
             for (MethodDef method : allMethods) {
@@ -1486,9 +1615,22 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
             }
             sb.append("    }\n");
         }
-
         sb.append("}\n");
         return sb.toString();
+    }
+
+    private void appendNamespaceImports(StringBuilder sb, List<MethodDef> allMethods) {
+        boolean hasMethods = !allMethods.isEmpty();
+        if (allMethods.stream().anyMatch(Gtk4WrapperGeneratorTask::isNeedsArena)) sb.append("import java.lang.foreign.Arena;\n");
+        if (hasMethods) sb.append("import java.lang.foreign.FunctionDescriptor;\n");
+        sb.append("import java.lang.foreign.MemorySegment;\n");
+        if (hasMethods) sb.append("import java.lang.foreign.ValueLayout;\n");
+        if (hasMethods) sb.append("\n");
+        Set<String> invokeImports = collectInvokeImports(allMethods);
+        for (String imp : invokeImports.stream().sorted().toList()) {
+            sb.append("import static ").append(packageName).append(".NativeSymbolLookup.").append(imp).append(";\n");
+        }
+        if (!invokeImports.isEmpty()) sb.append("\n");
     }
 
     private String generateMethod(MethodDef method) {
@@ -1525,36 +1667,13 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
     private String generateMethodBody(MethodDef method, String ind) {
         StringBuilder sb = new StringBuilder();
         String returnType = method.returnType != null ? method.returnType : "void";
-        String fieldName = handleName(method);
-
         List<String> post = new ArrayList<>();
         List<String> args = new ArrayList<>();
-        if (!method.isStatic) args.add(generatingInterface ? "getPointer()" : generatingStruct ? "seg" : "ptr");
+        if (!method.isStatic) {
+            args.add(generatingInterface ? "getPointer()" : generatingStruct ? "seg" : "ptr");
+        }
         for (ParamDef p : method.params) {
-            if (p.implicitOut) {
-                sb.append(ind).append("MemorySegment _").append(p.name).append(" = arena.allocate(")
-                  .append(getValueLayout(p.elemType)).append(");\n");
-                args.add("_" + p.name);
-            } else if (p.holder) {
-                String tmp = "_" + p.name;
-                String layout = getValueLayout(p.elemType);
-                String present = p.name + " != null && " + p.name + ".length > 0";
-                sb.append(ind).append("MemorySegment ").append(tmp).append(" = ").append(p.name)
-                  .append(" != null ? arena.allocate(").append(layout).append(") : MemorySegment.NULL;\n");
-                if ("inout".equals(p.direction) && VALUE_LAYOUT_MAP.containsKey(p.elemType)
-                        && !"String".equals(p.elemType) && !"MemorySegment".equals(p.elemType)) {
-                    String value = "boolean".equals(p.elemType) ? "(" + p.name + "[0] ? 1 : 0)" : p.name + "[0]";
-                    sb.append(ind).append("if (").append(present).append(") ").append(tmp)
-                      .append(".set(").append(layout).append(", 0L, ").append(value).append(");\n");
-                }
-                post.add("if (" + present + ") " + p.name + "[0] = "
-                    + convertNativeExpr(p.elemType, tmp + ".get(" + layout + ", 0L)", p.transferFull) + ";");
-                args.add(tmp);
-            } else if (p.implicitValue != null) {
-                args.add(p.implicitValue);
-            } else {
-                args.add(convertParamExpr(p.type, p.name));
-            }
+            args.add(argument(sb, ind, p, post));
         }
         if (method.throwsError) {
             // GError** out parameter; zero-initialized by the arena
@@ -1562,52 +1681,93 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
             args.add("_error");
             post.add(0, "checkError(_error);");
         }
-        String call = invokeCall(fieldName, returnType, String.join(", ", args));
+        String call = invokeCall(handleName(method), returnType, String.join(", ", args));
+        if (post.isEmpty() && appendDirectReturn(sb, ind, returnType, call)) {
+            return sb.toString();
+        }
+        appendCallWithResult(sb, ind, returnType, call);
+        for (String stmt : post) {
+            sb.append(ind).append(stmt).append("\n");
+        }
+        if (!"void".equals(returnType)) {
+            sb.append(ind).append("return ").append(resultExpr(method, returnType)).append(";\n");
+        }
+        return sb.toString();
+    }
 
-        if (post.isEmpty()) {
-            switch (returnType) {
-                case "void":
-                    appendInvoke(sb, ind, call + ";");
-                    return sb.toString();
-                case "int":
-                case "long":
-                case "double":
-                case "float":
-                case "MemorySegment":
-                    appendInvoke(sb, ind, "return " + call + ";");
-                    return sb.toString();
-                case "boolean":
-                    appendInvoke(sb, ind, "return " + call + " != 0;");
-                    return sb.toString();
-                default:
-                    break;
+    /**
+     * The native argument of a parameter, with the declarations it needs; the
+     * values of out parameters are copied back by statements added to post.
+     */
+    private String argument(StringBuilder sb, String ind, ParamDef p, List<String> post) {
+        if (p.implicitOut) {
+            sb.append(ind).append("MemorySegment _").append(p.name).append(" = arena.allocate(")
+              .append(getValueLayout(p.elemType)).append(");\n");
+            return "_" + p.name;
+        }
+        if (p.holder) {
+            return holderArgument(sb, ind, p, post);
+        }
+        return p.implicitValue != null ? p.implicitValue : convertParamExpr(p.type, p.name);
+    }
+
+    /** An out or inout parameter passed through a single-element array. */
+    private String holderArgument(StringBuilder sb, String ind, ParamDef p, List<String> post) {
+        String tmp = "_" + p.name;
+        String layout = getValueLayout(p.elemType);
+        String present = p.name + " != null && " + p.name + ".length > 0";
+        sb.append(ind).append("MemorySegment ").append(tmp).append(" = ").append(p.name)
+          .append(" != null ? arena.allocate(").append(layout).append(") : MemorySegment.NULL;\n");
+        if ("inout".equals(p.direction) && VALUE_LAYOUT_MAP.containsKey(p.elemType)
+                && !"String".equals(p.elemType) && !"MemorySegment".equals(p.elemType)) {
+            String value = "boolean".equals(p.elemType) ? "(" + p.name + "[0] ? 1 : 0)" : p.name + "[0]";
+            sb.append(ind).append("if (").append(present).append(") ").append(tmp)
+              .append(".set(").append(layout).append(", 0L, ").append(value).append(");\n");
+        }
+        post.add("if (" + present + ") " + p.name + "[0] = "
+            + convertNativeExpr(p.elemType, tmp + ".get(" + layout + ", 0L)", p.transferFull) + ";");
+        return tmp;
+    }
+
+    /**
+     * Returns the result of the call directly, when it needs no conversion.
+     *
+     * @return whether it did
+     */
+    private boolean appendDirectReturn(StringBuilder sb, String ind, String returnType, String call) {
+        switch (returnType) {
+            case "void" -> appendInvoke(sb, ind, call + ";");
+            case "int", "long", "double", "float", "MemorySegment" -> appendInvoke(sb, ind, "return " + call + ";");
+            case "boolean" -> appendInvoke(sb, ind, "return " + call + " != 0;");
+            default -> {
+                return false;
             }
         }
+        return true;
+    }
 
+    /** The call, storing its result in _r for the statements that follow. */
+    private void appendCallWithResult(StringBuilder sb, String ind, String returnType, String call) {
         if ("void".equals(returnType)) {
             appendInvoke(sb, ind, call + ";");
         } else if ("boolean".equals(returnType)) {
             sb.append(ind).append("boolean _r;\n");
             appendInvoke(sb, ind, "_r = " + call + " != 0;");
-        } else if (isPrimitiveJavaType(returnType)) {
-            sb.append(ind).append(returnType).append(" _r;\n");
-            appendInvoke(sb, ind, "_r = " + call + ";");
         } else {
-            sb.append(ind).append("MemorySegment _r;\n");
+            sb.append(ind).append(isPrimitiveJavaType(returnType) ? returnType : "MemorySegment").append(" _r;\n");
             appendInvoke(sb, ind, "_r = " + call + ";");
         }
-        for (String stmt : post) {
-            sb.append(ind).append(stmt).append("\n");
+    }
+
+    /** The result, converted from _r to the Java type of the return value. */
+    private String resultExpr(MethodDef method, String returnType) {
+        if (isPrimitiveJavaType(returnType) || "boolean".equals(returnType)) {
+            return "_r";
         }
-        if (!"void".equals(returnType)) {
-            String result = isPrimitiveJavaType(returnType) || "boolean".equals(returnType)
-                ? "_r"
-                : "byte[]".equals(returnType)
-                    ? "readBytes(_r, " + method.returnLengthExpr + ", " + method.returnTransferFull + ")"
-                    : convertNativeExpr(returnType, "_r", method.returnTransferFull);
-            sb.append(ind).append("return ").append(result).append(";\n");
+        if ("byte[]".equals(returnType)) {
+            return "readBytes(_r, " + method.returnLengthExpr + ", " + method.returnTransferFull + ")";
         }
-        return sb.toString();
+        return convertNativeExpr(returnType, "_r", method.returnTransferFull);
     }
 
     private static String invokeCall(String fieldName, String returnType, String argStr) {
@@ -1724,49 +1884,43 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
         }
     }
 
+    /** The Java literal of the value of a constant, or null when it is not one of its type. */
     public static String toJavaLiteral(String jType, String value) {
-        switch (jType) {
-            case "int":
-                try {
-                    Integer.parseInt(value);
-                    return value;
-                } catch (NumberFormatException ignored) {}
-                try {
-                    return String.format("0x%08X", Integer.parseUnsignedInt(value));
-                } catch (NumberFormatException ignored) {
-                    return null;
-                }
-            case "long":
-                try {
-                    Long.parseLong(value);
-                    return value + "L";
-                } catch (NumberFormatException ignored) {
-                    try {
-                        long l = Long.parseUnsignedLong(value);
-                        return l + "L";
-                    } catch (NumberFormatException ignored2) {
-                        return null;
-                    }
-                }
-            case "double":
-                try {
-                    Double.parseDouble(value);
-                    return value + (value.contains(".") || value.contains("e") ? "" : ".0");
-                } catch (NumberFormatException ignored) {
-                    return null;
-                }
-            case "float":
-                try {
-                    Float.parseFloat(value);
-                    return value;
-                } catch (NumberFormatException ignored) {
-                    return null;
-                }
-            case "String":
-                if (value == null) return null;
-                return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
-            default:
-                return null;
+        return switch (jType) {
+            case "int" -> intLiteral(value);
+            case "long" -> longLiteral(value);
+            case "double" -> isNumber(value, Double::parseDouble)
+                    ? value + (value.contains(".") || value.contains("e") ? "" : ".0") : null;
+            case "float" -> isNumber(value, Float::parseFloat) ? value : null;
+            case "String" -> value == null ? null
+                    : "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+            default -> null;
+        };
+    }
+
+    /** An int, or an unsigned one in hexadecimal. */
+    private static String intLiteral(String value) {
+        if (isNumber(value, Integer::parseInt)) {
+            return value;
+        }
+        return isNumber(value, Integer::parseUnsignedInt)
+                ? String.format("0x%08X", Integer.parseUnsignedInt(value)) : null;
+    }
+
+    /** A long, or an unsigned one as the long of the same bits. */
+    private static String longLiteral(String value) {
+        if (isNumber(value, Long::parseLong)) {
+            return value + "L";
+        }
+        return isNumber(value, Long::parseUnsignedLong) ? Long.parseUnsignedLong(value) + "L" : null;
+    }
+
+    private static boolean isNumber(String value, java.util.function.Function<String, ?> parser) {
+        try {
+            parser.apply(value);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
         }
     }
 

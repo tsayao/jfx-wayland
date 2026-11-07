@@ -241,47 +241,52 @@ public class VulkanBindingsGeneratorTask extends DefaultTask {
 
     private void parseTypes(Element types) {
         for (Element type : children(types, "type")) {
-            if (!supportsVulkan(type.getAttribute("api"))) {
+            String name = typeName(type);
+            if (!supportsVulkan(type.getAttribute("api")) || name == null || name.isEmpty()) {
                 continue;
             }
             String category = type.getAttribute("category");
-            String name = type.hasAttribute("name") ? type.getAttribute("name") : textOf(child(type, "name"));
-            if (name == null && child(type, "proto") != null) {
-                // Function pointer types
-                name = textOf(child(child(type, "proto"), "name"));
-            }
-            if (name == null || name.isEmpty()) {
-                continue;
-            }
+            typeCategory.put(name, category);
             if (type.hasAttribute("alias")) {
                 typeAlias.put(name, type.getAttribute("alias"));
-                typeCategory.put(name, category);
                 continue;
             }
-            typeCategory.put(name, category);
             switch (category) {
-                case "bitmask" -> {
-                    String bits = type.hasAttribute("requires") ? type.getAttribute("requires")
-                            : type.getAttribute("bitvalues");
-                    if (!bits.isEmpty()) {
-                        bitmaskBits.put(name, bits);
-                    }
-                    String base = textOf(child(type, "type"));
-                    bitmaskKind.put(name, "VkFlags64".equals(base) ? Kind.LONG : Kind.INT);
-                }
-                case "struct", "union" -> {
-                    List<Member> members = new ArrayList<>();
-                    for (Element m : children(type, "member")) {
-                        if (!supportsVulkan(m.getAttribute("api"))) {
-                            continue;
-                        }
-                        members.add(parseMember(m));
-                    }
-                    structs.put(name, new StructDef(name, category.equals("union"), members));
-                }
+                case "bitmask" -> parseBitmask(type, name);
+                case "struct", "union" -> structs.put(name, new StructDef(name, category.equals("union"), members(type)));
                 default -> { }
             }
         }
+    }
+
+    /** The name of a type: its attribute, its name element, or that of its prototype for function pointers. */
+    private static String typeName(Element type) {
+        String name = type.hasAttribute("name") ? type.getAttribute("name") : textOf(child(type, "name"));
+        if (name == null && child(type, "proto") != null) {
+            name = textOf(child(child(type, "proto"), "name"));
+        }
+        return name;
+    }
+
+    /** The bits of a bitmask and whether it is 32 or 64 bits wide. */
+    private void parseBitmask(Element type, String name) {
+        String bits = type.hasAttribute("requires") ? type.getAttribute("requires") : type.getAttribute("bitvalues");
+        if (!bits.isEmpty()) {
+            bitmaskBits.put(name, bits);
+        }
+        String base = textOf(child(type, "type"));
+        bitmaskKind.put(name, "VkFlags64".equals(base) ? Kind.LONG : Kind.INT);
+    }
+
+    /** The members of a structure or union that Vulkan has. */
+    private List<Member> members(Element type) {
+        List<Member> members = new ArrayList<>();
+        for (Element m : children(type, "member")) {
+            if (supportsVulkan(m.getAttribute("api"))) {
+                members.add(parseMember(m));
+            }
+        }
+        return members;
     }
 
     private Member parseMember(Element m) {
@@ -543,48 +548,41 @@ public class VulkanBindingsGeneratorTask extends DefaultTask {
         return Long.parseLong(value);
     }
 
+    /** The C layout of a structure or union, computed once. */
     private Layout layoutOf(String structName) {
-        structName = resolveType(structName);
-        Layout cached = layouts.get(structName);
+        String name = resolveType(structName);
+        Layout cached = layouts.get(name);
         if (cached != null) {
             return cached;
         }
-        StructDef def = structs.get(structName);
+        StructDef def = structs.get(name);
         List<Field> fields = new ArrayList<>();
         long offset = 0;
         long maxAlign = 1;
         long maxSize = 0;
         for (Member m : def.members()) {
-            if (m.bitField()) {
-                throw new GradleException("Bit fields are not supported: " + structName + "." + m.name());
-            }
-            long count = arrayCount(m.arrayLen());
-            Kind kind = kindOf(m.type(), m.pointers());
-            long elemSize;
-            long align;
-            if (kind != null) {
-                elemSize = kind.size;
-                align = kind.size;
-            } else {
-                Layout nested = layoutOf(m.type());
-                elemSize = nested.size();
-                align = nested.align();
-            }
-            long size = elemSize * count;
-            if (def.union()) {
-                fields.add(new Field(m, 0, size, align, kind, count));
-                maxSize = Math.max(maxSize, size);
-            } else {
-                offset = alignUp(offset, align);
-                fields.add(new Field(m, offset, size, align, kind, count));
-                offset += size;
-            }
-            maxAlign = Math.max(maxAlign, align);
+            Field field = memberField(name, m, def.union() ? 0 : offset);
+            fields.add(field);
+            maxSize = Math.max(maxSize, field.size());
+            offset = field.offset() + field.size();
+            maxAlign = Math.max(maxAlign, field.align());
         }
         long size = alignUp(def.union() ? maxSize : offset, maxAlign);
         Layout layout = new Layout(size, maxAlign, fields);
-        layouts.put(structName, layout);
+        layouts.put(name, layout);
         return layout;
+    }
+
+    /** A member placed at the first offset from a given one that its alignment allows. */
+    private Field memberField(String structName, Member m, long offset) {
+        if (m.bitField()) {
+            throw new GradleException("Bit fields are not supported: " + structName + "." + m.name());
+        }
+        long count = arrayCount(m.arrayLen());
+        Kind kind = kindOf(m.type(), m.pointers());
+        long elemSize = kind != null ? kind.size : layoutOf(m.type()).size();
+        long align = kind != null ? kind.size : layoutOf(m.type()).align();
+        return new Field(m, alignUp(offset, align), elemSize * count, align, kind, count);
     }
 
     private static long alignUp(long value, long align) {
@@ -603,18 +601,51 @@ public class VulkanBindingsGeneratorTask extends DefaultTask {
 
     private String generateStruct(StructDef def) {
         Layout layout = layoutOf(def.name());
+        String sType = sTypeOf(layout);
         StringBuilder sb = new StringBuilder(HEADER);
         sb.append("package ").append(packageName).append(";\n\n");
-        sb.append("import java.lang.foreign.MemoryLayout;\n");
-        sb.append("import java.lang.foreign.MemorySegment;\n");
-        sb.append("import java.lang.foreign.SegmentAllocator;\n");
-        sb.append("import java.lang.foreign.ValueLayout;\n\n");
+        sb.append(STRUCT_IMPORTS);
         sb.append("/** The {@code ").append(def.name()).append("} ").append(def.union() ? "union" : "structure")
                 .append(". */\n");
         sb.append("public final class ").append(def.name()).append(" {\n\n");
-
         sb.append("    public static final MemoryLayout LAYOUT = MemoryLayout.")
                 .append(def.union() ? "unionLayout" : "structLayout").append("(\n");
+        sb.append("        ").append(String.join(",\n        ", layoutElements(def, layout))).append(");\n\n");
+        sb.append("    public static final long SIZEOF = ").append(layout.size()).append(";\n\n");
+        for (Field f : layout.fields()) {
+            sb.append("    private static final long OFFSET_").append(f.member().name()).append(" = ")
+                    .append(f.offset()).append(";\n");
+        }
+        sb.append("\n    private ").append(def.name()).append("() {}\n\n");
+        appendAllocators(sb, sType);
+        for (Field f : layout.fields()) {
+            generateAccessors(sb, f);
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    private static final String STRUCT_IMPORTS = """
+            import java.lang.foreign.MemoryLayout;
+            import java.lang.foreign.MemorySegment;
+            import java.lang.foreign.SegmentAllocator;
+            import java.lang.foreign.ValueLayout;
+
+            """;
+
+    /** The value of the sType member of a structure, or null when it has none. */
+    private static String sTypeOf(Layout layout) {
+        String sType = null;
+        for (Field f : layout.fields()) {
+            if (f.member().name().equals("sType") && f.member().values() != null) {
+                sType = f.member().values();
+            }
+        }
+        return sType;
+    }
+
+    /** The members of the layout, with the padding of a structure between and after them. */
+    private List<String> layoutElements(StructDef def, Layout layout) {
         List<String> elements = new ArrayList<>();
         long offset = 0;
         for (Field f : layout.fields()) {
@@ -631,50 +662,45 @@ public class VulkanBindingsGeneratorTask extends DefaultTask {
         if (!def.union() && layout.size() > offset) {
             elements.add("MemoryLayout.paddingLayout(" + (layout.size() - offset) + ")");
         }
-        sb.append("        ").append(String.join(",\n        ", elements)).append(");\n\n");
-        sb.append("    public static final long SIZEOF = ").append(layout.size()).append(";\n\n");
+        return elements;
+    }
 
-        for (Field f : layout.fields()) {
-            sb.append("    private static final long OFFSET_").append(f.member().name()).append(" = ")
-                    .append(f.offset()).append(";\n");
-        }
-        sb.append("\n    private ").append(def.name()).append("() {}\n\n");
-
-        String sType = null;
-        for (Field f : layout.fields()) {
-            if (f.member().name().equals("sType") && f.member().values() != null) {
-                sType = f.member().values();
-            }
-        }
+    /** allocate, allocateArray and at; the allocations set the sType of each instance. */
+    private static void appendAllocators(StringBuilder sb, String sType) {
         sb.append("    /** Allocates a zeroed instance").append(sType != null ? " with its sType set" : "")
                 .append(". */\n");
-        sb.append("    public static MemorySegment allocate(SegmentAllocator allocator) {\n");
-        sb.append("        MemorySegment s = allocator.allocate(LAYOUT);\n");
-        sb.append("        s.fill((byte) 0);\n");
+        sb.append("""
+                    public static MemorySegment allocate(SegmentAllocator allocator) {
+                        MemorySegment s = allocator.allocate(LAYOUT);
+                        s.fill((byte) 0);
+                """);
         if (sType != null) {
             sb.append("        s.set(ValueLayout.JAVA_INT, OFFSET_sType, VK.").append(sType).append(");\n");
         }
-        sb.append("        return s;\n    }\n\n");
-        sb.append("    /** Allocates a zeroed array of instances. */\n");
-        sb.append("    public static MemorySegment allocateArray(SegmentAllocator allocator, long count) {\n");
-        sb.append("        MemorySegment s = allocator.allocate(LAYOUT, count);\n");
-        sb.append("        s.fill((byte) 0);\n");
+        sb.append("""
+                        return s;
+                    }
+
+                    /** Allocates a zeroed array of instances. */
+                    public static MemorySegment allocateArray(SegmentAllocator allocator, long count) {
+                        MemorySegment s = allocator.allocate(LAYOUT, count);
+                        s.fill((byte) 0);
+                """);
         if (sType != null) {
             sb.append("        for (long i = 0; i < count; i++) {\n");
             sb.append("            s.set(ValueLayout.JAVA_INT, i * SIZEOF + OFFSET_sType, VK.").append(sType)
                     .append(");\n");
             sb.append("        }\n");
         }
-        sb.append("        return s;\n    }\n\n");
-        sb.append("    /** The element of an array of instances. */\n");
-        sb.append("    public static MemorySegment at(MemorySegment array, long index) {\n");
-        sb.append("        return array.asSlice(index * SIZEOF, SIZEOF);\n    }\n");
+        sb.append("""
+                        return s;
+                    }
 
-        for (Field f : layout.fields()) {
-            generateAccessors(sb, f);
-        }
-        sb.append("}\n");
-        return sb.toString();
+                    /** The element of an array of instances. */
+                    public static MemorySegment at(MemorySegment array, long index) {
+                        return array.asSlice(index * SIZEOF, SIZEOF);
+                    }
+                """);
     }
 
     private void generateAccessors(StringBuilder sb, Field f) {
@@ -716,74 +742,46 @@ public class VulkanBindingsGeneratorTask extends DefaultTask {
     private String generateVK(Set<String> usedGroups) {
         StringBuilder sb = new StringBuilder(HEADER);
         sb.append("package ").append(packageName).append(";\n\n");
-        sb.append("import java.lang.foreign.Arena;\n");
-        sb.append("import java.lang.foreign.FunctionDescriptor;\n");
-        sb.append("import java.lang.foreign.Linker;\n");
-        sb.append("import java.lang.foreign.MemorySegment;\n");
-        sb.append("import java.lang.foreign.SymbolLookup;\n");
-        sb.append("import java.lang.foreign.ValueLayout;\n");
-        sb.append("import java.lang.invoke.MethodHandle;\n\n");
-        sb.append("/** Vulkan constants and commands. */\n");
-        sb.append("public final class VK {\n\n");
-        sb.append("    private VK() {}\n\n");
-
-        sb.append("    public static int VK_MAKE_API_VERSION(int variant, int major, int minor, int patch) {\n");
-        sb.append("        return (variant << 29) | (major << 22) | (minor << 12) | patch;\n    }\n\n");
-        for (int minor = 0; minor <= 4; minor++) {
-            sb.append("    public static final int VK_API_VERSION_1_").append(minor)
-                    .append(" = VK_MAKE_API_VERSION(0, 1, ").append(minor).append(", 0);\n");
-        }
-        sb.append("\n    // API constants\n");
-        Map<String, String> constantTypes = new HashMap<>();
-        for (var e : apiConstants.entrySet()) {
-            String type = apiConstantTypes.get(e.getKey());
-            String javaType = switch (type) {
-                case "uint64_t" -> "long";
-                case "float" -> "float";
-                default -> "int";
-            };
-            constantTypes.put(e.getKey(), javaType);
-            sb.append("    public static final ").append(javaType).append(" ").append(e.getKey()).append(" = ")
-                    .append(constantValue(e.getValue(), javaType)).append(";\n");
-        }
-
-        Map<String, String> emitted = new HashMap<>(constantTypes);
-        for (String group : usedGroups) {
-            Map<String, String> values = groups.get(group);
-            if (values == null) {
-                continue;
-            }
-            String javaType = Boolean.TRUE.equals(group64.get(group)) ? "long" : "int";
-            sb.append("\n    // ").append(group).append("\n");
-            for (var e : values.entrySet()) {
-                if (emitted.containsKey(e.getKey())) {
-                    continue;
-                }
-                emitted.put(e.getKey(), javaType);
-                sb.append("    public static final ").append(javaType).append(" ").append(e.getKey())
-                        .append(" = ").append(constantValue(e.getValue(), javaType)).append(";\n");
-            }
-        }
-        sb.append("\n    // Aliases\n");
-        for (var e : enumAliases.entrySet()) {
-            String target = e.getValue();
-            while (enumAliases.containsKey(target) && !emitted.containsKey(target)) {
-                target = enumAliases.get(target);
-            }
-            if (emitted.containsKey(target) && !emitted.containsKey(e.getKey())) {
-                String javaType = emitted.get(target);
-                emitted.put(e.getKey(), javaType);
-                sb.append("    public static final ").append(javaType).append(" ").append(e.getKey())
-                        .append(" = ").append(target).append(";\n");
-            }
-        }
+        sb.append(VK_CLASS_START);
+        appendApiVersions(sb);
+        Map<String, String> emitted = appendApiConstants(sb);
+        appendEnumGroups(sb, usedGroups, emitted);
+        appendEnumAliases(sb, emitted);
         sb.append("\n    // Extension names\n");
         for (var e : extensionStrings.entrySet()) {
             sb.append("    public static final String ").append(e.getKey()).append(" = ").append(e.getValue())
                     .append(";\n");
         }
+        sb.append(VK_HELPERS);
+        List<String> deviceCommands = appendCommands(sb);
+        appendLoadDeviceCommands(sb, deviceCommands);
+        appendIsAvailable(sb, deviceCommands);
+        sb.append("}\n");
+        return sb.toString();
+    }
 
-        sb.append("""
+    private static final String VK_CLASS_START = """
+            import java.lang.foreign.Arena;
+            import java.lang.foreign.FunctionDescriptor;
+            import java.lang.foreign.Linker;
+            import java.lang.foreign.MemorySegment;
+            import java.lang.foreign.SymbolLookup;
+            import java.lang.foreign.ValueLayout;
+            import java.lang.invoke.MethodHandle;
+
+            /** Vulkan constants and commands. */
+            public final class VK {
+
+                private VK() {}
+
+                public static int VK_MAKE_API_VERSION(int variant, int major, int minor, int patch) {
+                    return (variant << 29) | (major << 22) | (minor << 12) | patch;
+                }
+
+            """;
+
+    /** The loader of libvulkan and the helpers that the commands use. */
+    private static final String VK_HELPERS = """
 
                     private static final Linker LINKER = Linker.nativeLinker();
                     private static final SymbolLookup LOADER =
@@ -817,18 +815,89 @@ public class VulkanBindingsGeneratorTask extends DefaultTask {
                         return new RuntimeException(t);
                     }
 
-                """);
+                """;
 
+    private static void appendApiVersions(StringBuilder sb) {
+        for (int minor = 0; minor <= 4; minor++) {
+            sb.append("    public static final int VK_API_VERSION_1_").append(minor)
+                    .append(" = VK_MAKE_API_VERSION(0, 1, ").append(minor).append(", 0);\n");
+        }
+    }
+
+    /**
+     * The API constants, as long, float or int.
+     *
+     * @return the Java type of each constant emitted
+     */
+    private Map<String, String> appendApiConstants(StringBuilder sb) {
+        sb.append("\n    // API constants\n");
+        Map<String, String> emitted = new HashMap<>();
+        for (var e : apiConstants.entrySet()) {
+            String javaType = switch (apiConstantTypes.get(e.getKey())) {
+                case "uint64_t" -> "long";
+                case "float" -> "float";
+                default -> "int";
+            };
+            emitted.put(e.getKey(), javaType);
+            appendConstant(sb, javaType, e.getKey(), constantValue(e.getValue(), javaType));
+        }
+        return emitted;
+    }
+
+    /** The values of the enum and bitmask groups used, each once. */
+    private void appendEnumGroups(StringBuilder sb, Set<String> usedGroups, Map<String, String> emitted) {
+        for (String group : usedGroups) {
+            Map<String, String> values = groups.get(group);
+            if (values == null) {
+                continue;
+            }
+            String javaType = Boolean.TRUE.equals(group64.get(group)) ? "long" : "int";
+            sb.append("\n    // ").append(group).append("\n");
+            for (var e : values.entrySet()) {
+                if (emitted.putIfAbsent(e.getKey(), javaType) == null) {
+                    appendConstant(sb, javaType, e.getKey(), constantValue(e.getValue(), javaType));
+                }
+            }
+        }
+    }
+
+    /** The aliases of values that were emitted, following chains of aliases. */
+    private void appendEnumAliases(StringBuilder sb, Map<String, String> emitted) {
+        sb.append("\n    // Aliases\n");
+        for (var e : enumAliases.entrySet()) {
+            String target = e.getValue();
+            while (enumAliases.containsKey(target) && !emitted.containsKey(target)) {
+                target = enumAliases.get(target);
+            }
+            if (emitted.containsKey(target) && !emitted.containsKey(e.getKey())) {
+                String javaType = emitted.get(target);
+                emitted.put(e.getKey(), javaType);
+                appendConstant(sb, javaType, e.getKey(), target);
+            }
+        }
+    }
+
+    private static void appendConstant(StringBuilder sb, String javaType, String name, String value) {
+        sb.append("    public static final ").append(javaType).append(" ").append(name).append(" = ")
+                .append(value).append(";\n");
+    }
+
+    /**
+     * The commands: the core ones bound to the loader, the others resolved
+     * for a device by loadDeviceCommands.
+     *
+     * @return the commands resolved for a device
+     */
+    private List<String> appendCommands(StringBuilder sb) {
         List<String> deviceCommands = new ArrayList<>();
         for (String name : includeCommands) {
             CommandDef def = commandDef(name);
             boolean core = coreCommands.contains(name);
-            boolean critical = name.startsWith("vkCmd");
             String descriptor = descriptor(def);
             if (core) {
                 sb.append("    private static final class H_").append(name).append(" {\n");
                 sb.append("        static final MethodHandle MH = core(\"").append(name).append("\",\n");
-                sb.append("                ").append(descriptor).append(", ").append(critical).append(");\n");
+                sb.append("                ").append(descriptor).append(", ").append(isCritical(name)).append(");\n");
                 sb.append("    }\n\n");
             } else {
                 deviceCommands.add(name);
@@ -838,27 +907,39 @@ public class VulkanBindingsGeneratorTask extends DefaultTask {
             }
             generateCommand(sb, name, def, core);
         }
+        return deviceCommands;
+    }
 
-        sb.append("    /**\n");
-        sb.append("     * Resolves the commands that are not exported by the loader for a device.\n");
-        sb.append("     */\n");
-        sb.append("    public static void loadDeviceCommands(long device) {\n");
-        sb.append("        try (Arena arena = Arena.ofConfined()) {\n");
+    /** The recording commands are critical: they do not block and are called often. */
+    private static boolean isCritical(String command) {
+        return command.startsWith("vkCmd");
+    }
+
+    private static void appendLoadDeviceCommands(StringBuilder sb, List<String> deviceCommands) {
+        sb.append("""
+                    /**
+                     * Resolves the commands that are not exported by the loader for a device.
+                     */
+                    public static void loadDeviceCommands(long device) {
+                        try (Arena arena = Arena.ofConfined()) {
+                """);
         for (String name : deviceCommands) {
-            boolean critical = name.startsWith("vkCmd");
             sb.append("            mh_").append(name).append(" = resolved(vkGetDeviceProcAddr(device, arena.allocateFrom(\"")
-                    .append(name).append("\")), FD_").append(name).append(", ").append(critical).append(");\n");
+                    .append(name).append("\")), FD_").append(name).append(", ").append(isCritical(name)).append(");\n");
         }
         sb.append("        }\n    }\n\n");
-        sb.append("    /** Whether a command resolved by {@link #loadDeviceCommands} is available. */\n");
-        sb.append("    public static boolean isAvailable(String command) {\n");
-        sb.append("        return switch (command) {\n");
+    }
+
+    private static void appendIsAvailable(StringBuilder sb, List<String> deviceCommands) {
+        sb.append("""
+                    /** Whether a command resolved by {@link #loadDeviceCommands} is available. */
+                    public static boolean isAvailable(String command) {
+                        return switch (command) {
+                """);
         for (String name : deviceCommands) {
             sb.append("            case \"").append(name).append("\" -> mh_").append(name).append(" != null;\n");
         }
         sb.append("            default -> true;\n        };\n    }\n");
-        sb.append("}\n");
-        return sb.toString();
     }
 
     private String constantValue(String value, String javaType) {
