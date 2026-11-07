@@ -312,153 +312,204 @@ final class VKDevice {
         };
     }
 
-    private static boolean hasExtension(List<String> extensions, String name) {
-        return extensions.contains(name);
-    }
-
+    /**
+     * Chooses the physical device and its graphics queue, and creates the
+     * device with the extensions the pipeline uses; returns false, with the
+     * reason in getFailure(), when no device is usable.
+     */
     private boolean createDevice() {
         long mark = scratch.mark();
         try {
-            MemorySegment count = scratch.allocate(JAVA_INT);
-            vkEnumeratePhysicalDevices(instance, count, MemorySegment.NULL);
-            int n = count.get(JAVA_INT, 0);
-            if (n == 0) {
-                return fail("no Vulkan devices");
+            if (!choosePhysicalDevice() || !chooseQueueFamily()) {
+                return false;
             }
-            MemorySegment devices = scratch.allocate(JAVA_LONG, n);
-            vkEnumeratePhysicalDevices(instance, count, devices);
-
-            String requested = System.getenv("PRISM_VK_DEVICE");
-            int best = -1;
-            int bestScore = -1;
-            MemorySegment props = VkPhysicalDeviceProperties.allocate(scratch);
-            for (int i = 0; i < n; i++) {
-                vkGetPhysicalDeviceProperties(devices.getAtIndex(JAVA_LONG, i), props);
-                String name = VkPhysicalDeviceProperties.deviceName(props).getString(0);
-                int score = deviceScore(props);
-                log("device %d: %s (score %d)", i, name, score);
-                if (requested != null && name.contains(requested) && score >= 0) {
-                    best = i;
-                    break;
-                }
-                if (score > bestScore) {
-                    best = i;
-                    bestScore = score;
-                }
+            List<String> extensions = chooseExtensions(availableExtensions());
+            if (extensions == null) {
+                return false;
             }
-            if (best < 0) {
-                return fail("no Vulkan 1.3 hardware device");
-            }
-            physicalDevice = devices.getAtIndex(JAVA_LONG, best);
-            vkGetPhysicalDeviceProperties(physicalDevice, properties);
-            vkGetPhysicalDeviceMemoryProperties(physicalDevice, memoryProperties);
-            deviceName = VkPhysicalDeviceProperties.deviceName(properties).getString(0);
-
-            vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, count, MemorySegment.NULL);
-            int familyCount = count.get(JAVA_INT, 0);
-            MemorySegment families = VkQueueFamilyProperties.allocateArray(scratch, familyCount);
-            vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, count, families);
-            int family = -1;
-            for (int i = 0; i < familyCount; i++) {
-                if ((VkQueueFamilyProperties.queueFlags(VkQueueFamilyProperties.at(families, i))
-                        & VK_QUEUE_GRAPHICS_BIT) != 0) {
-                    family = i;
-                    break;
-                }
-            }
-            if (family < 0) {
-                return fail("no graphics queue");
-            }
-            queueFamily = family;
-
-            vkEnumerateDeviceExtensionProperties(physicalDevice, MemorySegment.NULL, count, MemorySegment.NULL);
-            int extCount = count.get(JAVA_INT, 0);
-            MemorySegment exts = VkExtensionProperties.allocateArray(scratch, Math.max(extCount, 1));
-            vkEnumerateDeviceExtensionProperties(physicalDevice, MemorySegment.NULL, count, exts);
-            List<String> available = new ArrayList<>();
-            for (int i = 0; i < extCount; i++) {
-                available.add(VkExtensionProperties.extensionName(VkExtensionProperties.at(exts, i)).getString(0));
-            }
-
-            List<String> enabled = new ArrayList<>();
-            // Push descriptors are core in Vulkan 1.4, whose drivers keep advertising the extension
-            if (!hasExtension(available, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
-                return fail("the device does not support VK_KHR_push_descriptor");
-            }
-            enabled.add(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-            if (hasExtension(available, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)
-                    && hasExtension(available, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
-                enabled.add(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
-                enabled.add(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-                exportSupported = true;
-                if (hasExtension(available, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
-                    enabled.add(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
-                    foreignQueueSupported = true;
-                }
-                if (hasExtension(available, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME)) {
-                    MemorySegment semInfo = VkPhysicalDeviceExternalSemaphoreInfo.allocate(scratch);
-                    VkPhysicalDeviceExternalSemaphoreInfo.handleType(semInfo,
-                            VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
-                    MemorySegment semProps = VkExternalSemaphoreProperties.allocate(scratch);
-                    vkGetPhysicalDeviceExternalSemaphoreProperties(physicalDevice, semInfo, semProps);
-                    if ((VkExternalSemaphoreProperties.externalSemaphoreFeatures(semProps)
-                            & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0) {
-                        enabled.add(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
-                        syncFileSupported = true;
-                    }
-                }
-            }
-
-            MemorySegment supported = VkPhysicalDeviceFeatures.allocate(scratch);
-            vkGetPhysicalDeviceFeatures(physicalDevice, supported);
-            fillModeNonSolid = VkPhysicalDeviceFeatures.fillModeNonSolid(supported) != 0;
-            MemorySegment features = VkPhysicalDeviceFeatures.allocate(scratch);
-            VkPhysicalDeviceFeatures.fillModeNonSolid(features, fillModeNonSolid ? VK_TRUE : VK_FALSE);
-            MemorySegment features13 = VkPhysicalDeviceVulkan13Features.allocate(scratch);
-            VkPhysicalDeviceVulkan13Features.dynamicRendering(features13, VK_TRUE);
-
-            MemorySegment priority = scratch.allocateFrom(JAVA_FLOAT, 1.0f);
-            MemorySegment queueInfo = VkDeviceQueueCreateInfo.allocate(scratch);
-            VkDeviceQueueCreateInfo.queueFamilyIndex(queueInfo, queueFamily);
-            VkDeviceQueueCreateInfo.queueCount(queueInfo, 1);
-            VkDeviceQueueCreateInfo.pQueuePriorities(queueInfo, priority);
-            MemorySegment names = scratch.allocate(ADDRESS, enabled.size());
-            for (int i = 0; i < enabled.size(); i++) {
-                names.setAtIndex(ADDRESS, i, scratch.allocateFrom(enabled.get(i)));
-            }
-            MemorySegment info = VkDeviceCreateInfo.allocate(scratch);
-            VkDeviceCreateInfo.pNext(info, features13);
-            VkDeviceCreateInfo.queueCreateInfoCount(info, 1);
-            VkDeviceCreateInfo.pQueueCreateInfos(info, queueInfo);
-            VkDeviceCreateInfo.enabledExtensionCount(info, enabled.size());
-            VkDeviceCreateInfo.ppEnabledExtensionNames(info, names);
-            VkDeviceCreateInfo.pEnabledFeatures(info, features);
-            MemorySegment p = scratch.allocate(JAVA_LONG);
-            check(vkCreateDevice(physicalDevice, info, MemorySegment.NULL, p), "vkCreateDevice");
-            device = handle(p);
-            vkGetDeviceQueue(device, queueFamily, 0, p);
-            queue = handle(p);
-
-            VK.loadDeviceCommands(device);
+            createLogicalDevice(extensions);
             if (!VK.isAvailable("vkCmdPushDescriptorSetKHR")) {
                 return fail("cannot resolve vkCmdPushDescriptorSetKHR");
             }
             exportSupported &= VK.isAvailable("vkGetMemoryFdKHR");
             syncFileSupported &= VK.isAvailable("vkGetSemaphoreFdKHR");
-
             chooseDepthFormat();
-            MemorySegment limits = VkPhysicalDeviceProperties.limits(properties);
-            int counts = VkPhysicalDeviceLimits.framebufferColorSampleCounts(limits)
-                    & VkPhysicalDeviceLimits.framebufferDepthSampleCounts(limits);
-            msaaSamples = (counts & VK_SAMPLE_COUNT_4_BIT) != 0 ? 4 : (counts & VK_SAMPLE_COUNT_2_BIT) != 0 ? 2 : 1;
-            minUniformAlignment = Math.max(VkPhysicalDeviceLimits.minUniformBufferOffsetAlignment(limits), 16);
-
+            readLimits();
             log("using %s (export %s, sync file %s, msaa %dx)", deviceName,
                     exportSupported ? "yes" : "no", syncFileSupported ? "yes" : "no", msaaSamples);
             return true;
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /**
+     * Chooses the device of PRISM_VK_DEVICE, or else the best one: discrete,
+     * then integrated, then virtual GPUs, but no software rasterizer.
+     */
+    private boolean choosePhysicalDevice() {
+        MemorySegment count = scratch.allocate(JAVA_INT);
+        vkEnumeratePhysicalDevices(instance, count, MemorySegment.NULL);
+        int n = count.get(JAVA_INT, 0);
+        if (n == 0) {
+            return fail("no Vulkan devices");
+        }
+        MemorySegment devices = scratch.allocate(JAVA_LONG, n);
+        vkEnumeratePhysicalDevices(instance, count, devices);
+        int best = bestDevice(devices, n, System.getenv("PRISM_VK_DEVICE"));
+        if (best < 0) {
+            return fail("no Vulkan 1.3 hardware device");
+        }
+        physicalDevice = devices.getAtIndex(JAVA_LONG, best);
+        vkGetPhysicalDeviceProperties(physicalDevice, properties);
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, memoryProperties);
+        deviceName = VkPhysicalDeviceProperties.deviceName(properties).getString(0);
+        return true;
+    }
+
+    private int bestDevice(MemorySegment devices, int n, String requested) {
+        int best = -1;
+        int bestScore = -1;
+        MemorySegment props = VkPhysicalDeviceProperties.allocate(scratch);
+        for (int i = 0; i < n; i++) {
+            vkGetPhysicalDeviceProperties(devices.getAtIndex(JAVA_LONG, i), props);
+            String name = VkPhysicalDeviceProperties.deviceName(props).getString(0);
+            int score = deviceScore(props);
+            log("device %d: %s (score %d)", i, name, score);
+            if (requested != null && name.contains(requested) && score >= 0) {
+                return i;
+            }
+            if (score > bestScore) {
+                best = i;
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    private boolean chooseQueueFamily() {
+        MemorySegment count = scratch.allocate(JAVA_INT);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, count, MemorySegment.NULL);
+        int familyCount = count.get(JAVA_INT, 0);
+        MemorySegment families = VkQueueFamilyProperties.allocateArray(scratch, familyCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, count, families);
+        for (int i = 0; i < familyCount; i++) {
+            int flags = VkQueueFamilyProperties.queueFlags(VkQueueFamilyProperties.at(families, i));
+            if ((flags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+                queueFamily = i;
+                return true;
+            }
+        }
+        return fail("no graphics queue");
+    }
+
+    private List<String> availableExtensions() {
+        MemorySegment count = scratch.allocate(JAVA_INT);
+        vkEnumerateDeviceExtensionProperties(physicalDevice, MemorySegment.NULL, count, MemorySegment.NULL);
+        int extCount = count.get(JAVA_INT, 0);
+        MemorySegment exts = VkExtensionProperties.allocateArray(scratch, Math.max(extCount, 1));
+        vkEnumerateDeviceExtensionProperties(physicalDevice, MemorySegment.NULL, count, exts);
+        List<String> available = new ArrayList<>();
+        for (int i = 0; i < extCount; i++) {
+            available.add(VkExtensionProperties.extensionName(VkExtensionProperties.at(exts, i)).getString(0));
+        }
+        return available;
+    }
+
+    /**
+     * The extensions to enable: push descriptors, which are required, and
+     * those of the dma-buf export and of the sync files, when available.
+     */
+    private List<String> chooseExtensions(List<String> available) {
+        // Push descriptors are core in Vulkan 1.4, whose drivers keep advertising the extension
+        if (!available.contains(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
+            fail("the device does not support VK_KHR_push_descriptor");
+            return null;
+        }
+        List<String> enabled = new ArrayList<>(List.of(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME));
+        if (available.contains(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)
+                && available.contains(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+            enabled.add(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+            enabled.add(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+            exportSupported = true;
+            if (available.contains(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
+                enabled.add(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+                foreignQueueSupported = true;
+            }
+            if (available.contains(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME) && canExportSyncFiles()) {
+                enabled.add(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+                syncFileSupported = true;
+            }
+        }
+        return enabled;
+    }
+
+    private boolean canExportSyncFiles() {
+        MemorySegment semInfo = VkPhysicalDeviceExternalSemaphoreInfo.allocate(scratch);
+        VkPhysicalDeviceExternalSemaphoreInfo.handleType(semInfo, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+        MemorySegment semProps = VkExternalSemaphoreProperties.allocate(scratch);
+        vkGetPhysicalDeviceExternalSemaphoreProperties(physicalDevice, semInfo, semProps);
+        return (VkExternalSemaphoreProperties.externalSemaphoreFeatures(semProps)
+                & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
+    }
+
+    /** Creates the device with one graphics queue, dynamic rendering and the extensions. */
+    private void createLogicalDevice(List<String> extensions) {
+        MemorySegment info = VkDeviceCreateInfo.allocate(scratch);
+        VkDeviceCreateInfo.pNext(info, vulkan13Features());
+        VkDeviceCreateInfo.queueCreateInfoCount(info, 1);
+        VkDeviceCreateInfo.pQueueCreateInfos(info, queueCreateInfo());
+        VkDeviceCreateInfo.enabledExtensionCount(info, extensions.size());
+        VkDeviceCreateInfo.ppEnabledExtensionNames(info, cStrings(extensions));
+        VkDeviceCreateInfo.pEnabledFeatures(info, deviceFeatures());
+        MemorySegment p = scratch.allocate(JAVA_LONG);
+        check(vkCreateDevice(physicalDevice, info, MemorySegment.NULL, p), "vkCreateDevice");
+        device = handle(p);
+        vkGetDeviceQueue(device, queueFamily, 0, p);
+        queue = handle(p);
+        VK.loadDeviceCommands(device);
+    }
+
+    private MemorySegment vulkan13Features() {
+        MemorySegment features13 = VkPhysicalDeviceVulkan13Features.allocate(scratch);
+        VkPhysicalDeviceVulkan13Features.dynamicRendering(features13, VK_TRUE);
+        return features13;
+    }
+
+    /** The features of Vulkan 1.0: the wireframe of the meshes, when supported. */
+    private MemorySegment deviceFeatures() {
+        MemorySegment supported = VkPhysicalDeviceFeatures.allocate(scratch);
+        vkGetPhysicalDeviceFeatures(physicalDevice, supported);
+        fillModeNonSolid = VkPhysicalDeviceFeatures.fillModeNonSolid(supported) != 0;
+        MemorySegment features = VkPhysicalDeviceFeatures.allocate(scratch);
+        VkPhysicalDeviceFeatures.fillModeNonSolid(features, fillModeNonSolid ? VK_TRUE : VK_FALSE);
+        return features;
+    }
+
+    private MemorySegment queueCreateInfo() {
+        MemorySegment queueInfo = VkDeviceQueueCreateInfo.allocate(scratch);
+        VkDeviceQueueCreateInfo.queueFamilyIndex(queueInfo, queueFamily);
+        VkDeviceQueueCreateInfo.queueCount(queueInfo, 1);
+        VkDeviceQueueCreateInfo.pQueuePriorities(queueInfo, scratch.allocateFrom(JAVA_FLOAT, 1.0f));
+        return queueInfo;
+    }
+
+    /** An array of C strings, allocated in the scratch memory. */
+    private MemorySegment cStrings(List<String> strings) {
+        MemorySegment names = scratch.allocate(ADDRESS, Math.max(strings.size(), 1));
+        for (int i = 0; i < strings.size(); i++) {
+            names.setAtIndex(ADDRESS, i, scratch.allocateFrom(strings.get(i)));
+        }
+        return names;
+    }
+
+    /** The multisampling and the alignment of the uniform blocks of the device. */
+    private void readLimits() {
+        MemorySegment limits = VkPhysicalDeviceProperties.limits(properties);
+        int counts = VkPhysicalDeviceLimits.framebufferColorSampleCounts(limits)
+                & VkPhysicalDeviceLimits.framebufferDepthSampleCounts(limits);
+        msaaSamples = (counts & VK_SAMPLE_COUNT_4_BIT) != 0 ? 4 : (counts & VK_SAMPLE_COUNT_2_BIT) != 0 ? 2 : 1;
+        minUniformAlignment = Math.max(VkPhysicalDeviceLimits.minUniformBufferOffsetAlignment(limits), 16);
     }
 
     private void chooseDepthFormat() {
@@ -477,128 +528,161 @@ final class VKDevice {
     private void createResources(byte[] vertexShader) {
         long mark = scratch.mark();
         try {
-            MemorySegment p = scratch.allocate(JAVA_LONG);
             for (int i = 0; i < FRAMES; i++) {
-                Frame frame = new Frame();
-                frames[i] = frame;
-                MemorySegment poolInfo = VkCommandPoolCreateInfo.allocate(scratch);
-                VkCommandPoolCreateInfo.flags(poolInfo, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT);
-                VkCommandPoolCreateInfo.queueFamilyIndex(poolInfo, queueFamily);
-                check(vkCreateCommandPool(device, poolInfo, MemorySegment.NULL, p), "vkCreateCommandPool");
-                frame.commandPool = handle(p);
-                MemorySegment cmdInfo = VkCommandBufferAllocateInfo.allocate(scratch);
-                VkCommandBufferAllocateInfo.commandPool(cmdInfo, frame.commandPool);
-                VkCommandBufferAllocateInfo.level(cmdInfo, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
-                VkCommandBufferAllocateInfo.commandBufferCount(cmdInfo, 1);
-                check(vkAllocateCommandBuffers(device, cmdInfo, p), "vkAllocateCommandBuffers");
-                frame.cmd = handle(p);
-                MemorySegment fenceInfo = VkFenceCreateInfo.allocate(scratch);
-                check(vkCreateFence(device, fenceInfo, MemorySegment.NULL, p), "vkCreateFence");
-                frame.fence = handle(p);
+                // Known before it is complete, so that destroy() releases it on a failure
+                frames[i] = new Frame();
+                initFrame(frames[i]);
             }
             if (syncFileSupported) {
-                MemorySegment exportInfo = VkExportSemaphoreCreateInfo.allocate(scratch);
-                VkExportSemaphoreCreateInfo.handleTypes(exportInfo, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
-                MemorySegment semInfo = VkSemaphoreCreateInfo.allocate(scratch);
-                VkSemaphoreCreateInfo.pNext(semInfo, exportInfo);
-                if (vkCreateSemaphore(device, semInfo, MemorySegment.NULL, p) == VK_SUCCESS) {
-                    presentSemaphore = handle(p);
-                } else {
-                    syncFileSupported = false;
-                }
+                createPresentSemaphore();
             }
-
-            // Host data: vertices, uniforms and staging
-            long[] ring = createBuffer(RING_SIZE,
-                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
-                    | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            ringBuffer = ring[0];
-            ringMemory = ring[1];
-            ringMapped = map(ringMemory, RING_SIZE);
-            frameIndex = 0;
-            cmd = frames[0].cmd;
-            ringOffset = 0;
-            ringLimit = RING_SIZE / FRAMES;
-
-            // Quad indices: 0 1 2, 1 2 3 for each quad
-            long indexSize = (long) MAX_QUADS * 6 * 2;
-            long[] index = createBuffer(indexSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            quadIndexBuffer = index[0];
-            quadIndexMemory = index[1];
-            MemorySegment indices = map(quadIndexMemory, indexSize);
-            for (int q = 0; q < MAX_QUADS; q++) {
-                short v = (short) (q * 4);
-                long base = q * 12L;
-                indices.set(ValueLayout.JAVA_SHORT, base, v);
-                indices.set(ValueLayout.JAVA_SHORT, base + 2, (short) (v + 1));
-                indices.set(ValueLayout.JAVA_SHORT, base + 4, (short) (v + 2));
-                indices.set(ValueLayout.JAVA_SHORT, base + 6, (short) (v + 1));
-                indices.set(ValueLayout.JAVA_SHORT, base + 8, (short) (v + 2));
-                indices.set(ValueLayout.JAVA_SHORT, base + 10, (short) (v + 3));
-            }
-            vkUnmapMemory(device, quadIndexMemory);
-
-            // One push descriptor set: the uniform block and the samplers
-            MemorySegment bindings = VkDescriptorSetLayoutBinding.allocateArray(scratch, 1 + MAX_TEXTURE_UNITS);
-            MemorySegment b0 = VkDescriptorSetLayoutBinding.at(bindings, 0);
-            VkDescriptorSetLayoutBinding.binding(b0, UNIFORM_BINDING);
-            VkDescriptorSetLayoutBinding.descriptorType(b0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-            VkDescriptorSetLayoutBinding.descriptorCount(b0, 1);
-            VkDescriptorSetLayoutBinding.stageFlags(b0, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
-            for (int i = 0; i < MAX_TEXTURE_UNITS; i++) {
-                MemorySegment b = VkDescriptorSetLayoutBinding.at(bindings, 1 + i);
-                VkDescriptorSetLayoutBinding.binding(b, FIRST_SAMPLER_BINDING + i);
-                VkDescriptorSetLayoutBinding.descriptorType(b, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-                VkDescriptorSetLayoutBinding.descriptorCount(b, 1);
-                VkDescriptorSetLayoutBinding.stageFlags(b, VK_SHADER_STAGE_FRAGMENT_BIT);
-            }
-            MemorySegment setInfo = VkDescriptorSetLayoutCreateInfo.allocate(scratch);
-            VkDescriptorSetLayoutCreateInfo.flags(setInfo, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
-            VkDescriptorSetLayoutCreateInfo.bindingCount(setInfo, 1 + MAX_TEXTURE_UNITS);
-            VkDescriptorSetLayoutCreateInfo.pBindings(setInfo, bindings);
-            check(vkCreateDescriptorSetLayout(device, setInfo, MemorySegment.NULL, p), "vkCreateDescriptorSetLayout");
-            setLayout = handle(p);
-            MemorySegment range = VkPushConstantRange.allocate(scratch);
-            VkPushConstantRange.stageFlags(range, VK_SHADER_STAGE_VERTEX_BIT);
-            VkPushConstantRange.size(range, 64);
-            MemorySegment layouts = scratch.allocateFrom(JAVA_LONG, setLayout);
-            MemorySegment layoutInfo = VkPipelineLayoutCreateInfo.allocate(scratch);
-            VkPipelineLayoutCreateInfo.setLayoutCount(layoutInfo, 1);
-            VkPipelineLayoutCreateInfo.pSetLayouts(layoutInfo, layouts);
-            VkPipelineLayoutCreateInfo.pushConstantRangeCount(layoutInfo, 1);
-            VkPipelineLayoutCreateInfo.pPushConstantRanges(layoutInfo, range);
-            check(vkCreatePipelineLayout(device, layoutInfo, MemorySegment.NULL, p), "vkCreatePipelineLayout");
-            pipelineLayout = handle(p);
-
+            createRing();
+            createQuadIndices();
+            createPipelineLayout();
             vertexModule = createShaderModule(vertexShader);
-
-            // Samplers for each filter and address mode
-            for (int linear = 0; linear < 2; linear++) {
-                for (int wrap = 0; wrap < WRAP_COUNT; wrap++) {
-                    int mode = wrap == WRAP_REPEAT ? VK_SAMPLER_ADDRESS_MODE_REPEAT
-                            : wrap == WRAP_CLAMP_TO_ZERO ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER
-                            : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-                    MemorySegment s = VkSamplerCreateInfo.allocate(scratch);
-                    VkSamplerCreateInfo.magFilter(s, linear == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-                    VkSamplerCreateInfo.minFilter(s, linear == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-                    VkSamplerCreateInfo.mipmapMode(s, VK_SAMPLER_MIPMAP_MODE_NEAREST);
-                    VkSamplerCreateInfo.addressModeU(s, mode);
-                    VkSamplerCreateInfo.addressModeV(s, mode);
-                    VkSamplerCreateInfo.addressModeW(s, mode);
-                    VkSamplerCreateInfo.maxLod(s, VK_LOD_CLAMP_NONE);
-                    VkSamplerCreateInfo.borderColor(s, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
-                    check(vkCreateSampler(device, s, MemorySegment.NULL, p), "vkCreateSampler");
-                    samplers[linear][wrap] = handle(p);
-                }
-            }
-            for (int i = 0; i < 16; i++) {
-                transform.setAtIndex(JAVA_FLOAT, i, i % 5 == 0 ? 1f : 0f);
-            }
+            createSamplers();
+            setTransform(IDENTITY);
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    private static final float[] IDENTITY = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+    /** Creates the command pool and buffer, and the fence, of a frame in flight. */
+    private void initFrame(Frame frame) {
+        MemorySegment p = scratch.allocate(JAVA_LONG);
+        MemorySegment poolInfo = VkCommandPoolCreateInfo.allocate(scratch);
+        VkCommandPoolCreateInfo.flags(poolInfo, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT);
+        VkCommandPoolCreateInfo.queueFamilyIndex(poolInfo, queueFamily);
+        check(vkCreateCommandPool(device, poolInfo, MemorySegment.NULL, p), "vkCreateCommandPool");
+        frame.commandPool = handle(p);
+        MemorySegment cmdInfo = VkCommandBufferAllocateInfo.allocate(scratch);
+        VkCommandBufferAllocateInfo.commandPool(cmdInfo, frame.commandPool);
+        VkCommandBufferAllocateInfo.level(cmdInfo, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+        VkCommandBufferAllocateInfo.commandBufferCount(cmdInfo, 1);
+        check(vkAllocateCommandBuffers(device, cmdInfo, p), "vkAllocateCommandBuffers");
+        frame.cmd = handle(p);
+        check(vkCreateFence(device, VkFenceCreateInfo.allocate(scratch), MemorySegment.NULL, p), "vkCreateFence");
+        frame.fence = handle(p);
+    }
+
+    /** The semaphore that the presented frames signal, exported as sync files. */
+    private void createPresentSemaphore() {
+        MemorySegment exportInfo = VkExportSemaphoreCreateInfo.allocate(scratch);
+        VkExportSemaphoreCreateInfo.handleTypes(exportInfo, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+        MemorySegment semInfo = VkSemaphoreCreateInfo.allocate(scratch);
+        VkSemaphoreCreateInfo.pNext(semInfo, exportInfo);
+        MemorySegment p = scratch.allocate(JAVA_LONG);
+        if (vkCreateSemaphore(device, semInfo, MemorySegment.NULL, p) == VK_SUCCESS) {
+            presentSemaphore = handle(p);
+        } else {
+            syncFileSupported = false;
+        }
+    }
+
+    /** The ring of the host data (vertices, uniforms and staging), half for each frame. */
+    private void createRing() {
+        long[] ring = createBuffer(RING_SIZE,
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        ringBuffer = ring[0];
+        ringMemory = ring[1];
+        ringMapped = map(ringMemory, RING_SIZE);
+        frameIndex = 0;
+        cmd = frames[0].cmd;
+        ringOffset = 0;
+        ringLimit = RING_SIZE / FRAMES;
+    }
+
+    /** The indices of the quads: 0 1 2, 1 2 3 for each quad. */
+    private void createQuadIndices() {
+        long indexSize = (long) MAX_QUADS * 6 * 2;
+        long[] index = createBuffer(indexSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        quadIndexBuffer = index[0];
+        quadIndexMemory = index[1];
+        MemorySegment indices = map(quadIndexMemory, indexSize);
+        for (int q = 0; q < MAX_QUADS; q++) {
+            short v = (short) (q * 4);
+            long base = q * 12L;
+            short[] quad = {v, (short) (v + 1), (short) (v + 2), (short) (v + 1), (short) (v + 2), (short) (v + 3)};
+            MemorySegment.copy(quad, 0, indices, ValueLayout.JAVA_SHORT, base, quad.length);
+        }
+        vkUnmapMemory(device, quadIndexMemory);
+    }
+
+    /**
+     * The layout of all the pipelines: one push descriptor set, with the
+     * uniform block and the samplers, and the transform as a push constant.
+     */
+    private void createPipelineLayout() {
+        MemorySegment p = scratch.allocate(JAVA_LONG);
+        MemorySegment setInfo = VkDescriptorSetLayoutCreateInfo.allocate(scratch);
+        VkDescriptorSetLayoutCreateInfo.flags(setInfo, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
+        VkDescriptorSetLayoutCreateInfo.bindingCount(setInfo, 1 + MAX_TEXTURE_UNITS);
+        VkDescriptorSetLayoutCreateInfo.pBindings(setInfo, descriptorBindings());
+        check(vkCreateDescriptorSetLayout(device, setInfo, MemorySegment.NULL, p), "vkCreateDescriptorSetLayout");
+        setLayout = handle(p);
+        MemorySegment range = VkPushConstantRange.allocate(scratch);
+        VkPushConstantRange.stageFlags(range, VK_SHADER_STAGE_VERTEX_BIT);
+        VkPushConstantRange.size(range, 64);
+        MemorySegment layoutInfo = VkPipelineLayoutCreateInfo.allocate(scratch);
+        VkPipelineLayoutCreateInfo.setLayoutCount(layoutInfo, 1);
+        VkPipelineLayoutCreateInfo.pSetLayouts(layoutInfo, scratch.allocateFrom(JAVA_LONG, setLayout));
+        VkPipelineLayoutCreateInfo.pushConstantRangeCount(layoutInfo, 1);
+        VkPipelineLayoutCreateInfo.pPushConstantRanges(layoutInfo, range);
+        check(vkCreatePipelineLayout(device, layoutInfo, MemorySegment.NULL, p), "vkCreatePipelineLayout");
+        pipelineLayout = handle(p);
+    }
+
+    private MemorySegment descriptorBindings() {
+        MemorySegment bindings = VkDescriptorSetLayoutBinding.allocateArray(scratch, 1 + MAX_TEXTURE_UNITS);
+        descriptorBinding(VkDescriptorSetLayoutBinding.at(bindings, 0), UNIFORM_BINDING,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+        for (int i = 0; i < MAX_TEXTURE_UNITS; i++) {
+            descriptorBinding(VkDescriptorSetLayoutBinding.at(bindings, 1 + i), FIRST_SAMPLER_BINDING + i,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT);
+        }
+        return bindings;
+    }
+
+    private static void descriptorBinding(MemorySegment b, int binding, int type, int stages) {
+        VkDescriptorSetLayoutBinding.binding(b, binding);
+        VkDescriptorSetLayoutBinding.descriptorType(b, type);
+        VkDescriptorSetLayoutBinding.descriptorCount(b, 1);
+        VkDescriptorSetLayoutBinding.stageFlags(b, stages);
+    }
+
+    /** A sampler for each filter and address mode. */
+    private void createSamplers() {
+        for (int linear = 0; linear < 2; linear++) {
+            for (int wrap = 0; wrap < WRAP_COUNT; wrap++) {
+                samplers[linear][wrap] = createSampler(linear == 1, wrap);
+            }
+        }
+    }
+
+    private long createSampler(boolean linear, int wrap) {
+        int mode = switch (wrap) {
+            case WRAP_REPEAT -> VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            case WRAP_CLAMP_TO_ZERO -> VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+            default -> VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        };
+        int filter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        MemorySegment s = VkSamplerCreateInfo.allocate(scratch);
+        VkSamplerCreateInfo.magFilter(s, filter);
+        VkSamplerCreateInfo.minFilter(s, filter);
+        VkSamplerCreateInfo.mipmapMode(s, VK_SAMPLER_MIPMAP_MODE_NEAREST);
+        VkSamplerCreateInfo.addressModeU(s, mode);
+        VkSamplerCreateInfo.addressModeV(s, mode);
+        VkSamplerCreateInfo.addressModeW(s, mode);
+        VkSamplerCreateInfo.maxLod(s, VK_LOD_CLAMP_NONE);
+        VkSamplerCreateInfo.borderColor(s, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
+        MemorySegment p = scratch.allocate(JAVA_LONG);
+        check(vkCreateSampler(device, s, MemorySegment.NULL, p), "vkCreateSampler");
+        return handle(p);
     }
 
     long createShaderModule(byte[] spirv) {
@@ -1051,49 +1135,69 @@ final class VKDevice {
         // Rendering resumed into a target that is already an attachment
         boolean resumed = target.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL && !target.foreign;
         transition(target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        boolean newDepth = false;
-        if (target.hasDepth() && target.depthLayout != VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL) {
-            transitionDepth(target);
-            newDepth = true;
-        }
+        boolean newDepth = prepareDepth(target);
         ensureRecording();
         if (resumed) {
             resumeBarrier(target, target.hasDepth() && !newDepth);
         }
         long mark = scratch.mark();
         try {
-            MemorySegment color = VkRenderingAttachmentInfo.allocate(scratch);
-            VkRenderingAttachmentInfo.imageView(color, target.view);
-            VkRenderingAttachmentInfo.imageLayout(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            VkRenderingAttachmentInfo.loadOp(color, VK_ATTACHMENT_LOAD_OP_LOAD);
-            VkRenderingAttachmentInfo.storeOp(color, VK_ATTACHMENT_STORE_OP_STORE);
-            MemorySegment info = VkRenderingInfo.allocate(scratch);
-            MemorySegment extent = VkRect2D.extent(VkRenderingInfo.renderArea(info));
-            VkExtent2D.width(extent, target.width);
-            VkExtent2D.height(extent, target.height);
-            VkRenderingInfo.layerCount(info, 1);
-            VkRenderingInfo.colorAttachmentCount(info, 1);
-            VkRenderingInfo.pColorAttachments(info, color);
-            if (target.hasDepth()) {
-                MemorySegment depth = VkRenderingAttachmentInfo.allocate(scratch);
-                VkRenderingAttachmentInfo.imageView(depth, target.depthView);
-                VkRenderingAttachmentInfo.imageLayout(depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
-                // A new depth buffer starts cleared to the far plane
-                VkRenderingAttachmentInfo.loadOp(depth, newDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                        : VK_ATTACHMENT_LOAD_OP_LOAD);
-                VkRenderingAttachmentInfo.storeOp(depth, VK_ATTACHMENT_STORE_OP_STORE);
-                VkClearDepthStencilValue.depth(VkClearValue.depthStencil(
-                        VkRenderingAttachmentInfo.clearValue(depth)), 1.0f);
-                VkRenderingInfo.pDepthAttachment(info, depth);
-                target.depthLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            }
-            vkCmdBeginRendering(cmd, info);
+            vkCmdBeginRendering(cmd, renderingInfo(target, newDepth));
             rendering = true;
             statRenderPasses++;
             return true;
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /**
+     * Makes the depth buffer of a target an attachment.
+     *
+     * @return whether the depth buffer is new, and so is to be cleared
+     */
+    private boolean prepareDepth(VKImage img) {
+        if (!img.hasDepth() || img.depthLayout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL) {
+            return false;
+        }
+        transitionDepth(img);
+        return true;
+    }
+
+    private MemorySegment renderingInfo(VKImage img, boolean newDepth) {
+        MemorySegment info = VkRenderingInfo.allocate(scratch);
+        MemorySegment extent = VkRect2D.extent(VkRenderingInfo.renderArea(info));
+        VkExtent2D.width(extent, img.width);
+        VkExtent2D.height(extent, img.height);
+        VkRenderingInfo.layerCount(info, 1);
+        VkRenderingInfo.colorAttachmentCount(info, 1);
+        VkRenderingInfo.pColorAttachments(info, colorAttachment(img));
+        if (img.hasDepth()) {
+            VkRenderingInfo.pDepthAttachment(info, depthAttachment(img, newDepth));
+            img.depthLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        }
+        return info;
+    }
+
+    /** The color attachment, whose content is kept: Prism draws over it. */
+    private MemorySegment colorAttachment(VKImage img) {
+        MemorySegment color = VkRenderingAttachmentInfo.allocate(scratch);
+        VkRenderingAttachmentInfo.imageView(color, img.view);
+        VkRenderingAttachmentInfo.imageLayout(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        VkRenderingAttachmentInfo.loadOp(color, VK_ATTACHMENT_LOAD_OP_LOAD);
+        VkRenderingAttachmentInfo.storeOp(color, VK_ATTACHMENT_STORE_OP_STORE);
+        return color;
+    }
+
+    /** The depth attachment; a new depth buffer starts cleared to the far plane. */
+    private MemorySegment depthAttachment(VKImage img, boolean clear) {
+        MemorySegment depth = VkRenderingAttachmentInfo.allocate(scratch);
+        VkRenderingAttachmentInfo.imageView(depth, img.depthView);
+        VkRenderingAttachmentInfo.imageLayout(depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+        VkRenderingAttachmentInfo.loadOp(depth, clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
+        VkRenderingAttachmentInfo.storeOp(depth, VK_ATTACHMENT_STORE_OP_STORE);
+        VkClearDepthStencilValue.depth(VkClearValue.depthStencil(VkRenderingAttachmentInfo.clearValue(depth)), 1.0f);
+        return depth;
     }
 
     /**
@@ -1105,28 +1209,16 @@ final class VKDevice {
         long mark = scratch.mark();
         try {
             MemorySegment barriers = VkImageMemoryBarrier.allocateArray(scratch, depth ? 2 : 1);
-            MemorySegment color = VkImageMemoryBarrier.at(barriers, 0);
-            VkImageMemoryBarrier.srcAccessMask(color, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-            VkImageMemoryBarrier.dstAccessMask(color,
+            attachmentBarrier(VkImageMemoryBarrier.at(barriers, 0), img.image,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-            VkImageMemoryBarrier.oldLayout(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            VkImageMemoryBarrier.newLayout(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            VkImageMemoryBarrier.srcQueueFamilyIndex(color, VK_QUEUE_FAMILY_IGNORED);
-            VkImageMemoryBarrier.dstQueueFamilyIndex(color, VK_QUEUE_FAMILY_IGNORED);
-            VkImageMemoryBarrier.image(color, img.image);
-            subresourceRange(VkImageMemoryBarrier.subresourceRange(color), VK_IMAGE_ASPECT_COLOR_BIT);
             int stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             if (depth) {
-                MemorySegment d = VkImageMemoryBarrier.at(barriers, 1);
-                VkImageMemoryBarrier.srcAccessMask(d, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-                VkImageMemoryBarrier.dstAccessMask(d, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
-                        | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-                VkImageMemoryBarrier.oldLayout(d, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
-                VkImageMemoryBarrier.newLayout(d, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
-                VkImageMemoryBarrier.srcQueueFamilyIndex(d, VK_QUEUE_FAMILY_IGNORED);
-                VkImageMemoryBarrier.dstQueueFamilyIndex(d, VK_QUEUE_FAMILY_IGNORED);
-                VkImageMemoryBarrier.image(d, img.depthImage);
-                subresourceRange(VkImageMemoryBarrier.subresourceRange(d), depthAspect());
+                attachmentBarrier(VkImageMemoryBarrier.at(barriers, 1), img.depthImage,
+                        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, depthAspect(),
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
                 stages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
             }
             vkCmdPipelineBarrier(cmd, stages, stages, 0, 0, MemorySegment.NULL, 0, MemorySegment.NULL,
@@ -1134,6 +1226,19 @@ final class VKDevice {
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /** A barrier on an attachment that keeps its layout. */
+    private static void attachmentBarrier(MemorySegment barrier, long image, int layout, int aspect,
+                                          int srcAccess, int dstAccess) {
+        VkImageMemoryBarrier.srcAccessMask(barrier, srcAccess);
+        VkImageMemoryBarrier.dstAccessMask(barrier, dstAccess);
+        VkImageMemoryBarrier.oldLayout(barrier, layout);
+        VkImageMemoryBarrier.newLayout(barrier, layout);
+        VkImageMemoryBarrier.srcQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_IGNORED);
+        VkImageMemoryBarrier.dstQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_IGNORED);
+        VkImageMemoryBarrier.image(barrier, image);
+        subresourceRange(VkImageMemoryBarrier.subresourceRange(barrier), aspect);
     }
 
     private void setScissor(MemorySegment rect, boolean clip) {
@@ -1157,6 +1262,12 @@ final class VKDevice {
 
     /** Sets the viewport, the scissor and the depth and culling state of a draw. */
     private void setDrawState(boolean clip, int cull) {
+        setViewportAndScissor(clip);
+        setDepthTest(depthTest && target.hasDepth() ? 1 : 0);
+        setCullMode(cull);
+    }
+
+    private void setViewportAndScissor(boolean clip) {
         MemorySegment viewport = VkViewport.allocate(scratch);
         // A negative height flips the viewport, so that +y in clip space is up as in D3D
         VkViewport.y(viewport, target.height);
@@ -1167,25 +1278,32 @@ final class VKDevice {
         MemorySegment scissor = VkRect2D.allocate(scratch);
         setScissor(scissor, clip);
         vkCmdSetScissor(cmd, 0, 1, scissor);
+    }
 
-        int depth = depthTest && target.hasDepth() ? 1 : 0;
-        if (depth != dynDepth) {
-            vkCmdSetDepthTestEnable(cmd, depth);
-            vkCmdSetDepthWriteEnable(cmd, depth);
-            if (dynDepth < 0) {
-                vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_LESS_OR_EQUAL);
-                vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
-            }
-            dynDepth = depth;
+    /** The depth test and writes, set again only when they change in the command buffer. */
+    private void setDepthTest(int depth) {
+        if (depth == dynDepth) {
+            return;
         }
-        if (cull != dynCull) {
-            vkCmdSetCullMode(cmd, switch (cull) {
-                case CULL_BACK -> VK_CULL_MODE_BACK_BIT;
-                case CULL_FRONT -> VK_CULL_MODE_FRONT_BIT;
-                default -> VK_CULL_MODE_NONE;
-            });
-            dynCull = cull;
+        vkCmdSetDepthTestEnable(cmd, depth);
+        vkCmdSetDepthWriteEnable(cmd, depth);
+        if (dynDepth < 0) {
+            vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_LESS_OR_EQUAL);
+            vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
         }
+        dynDepth = depth;
+    }
+
+    private void setCullMode(int cull) {
+        if (cull == dynCull) {
+            return;
+        }
+        vkCmdSetCullMode(cmd, switch (cull) {
+            case CULL_BACK -> VK_CULL_MODE_BACK_BIT;
+            case CULL_FRONT -> VK_CULL_MODE_FRONT_BIT;
+            default -> VK_CULL_MODE_NONE;
+        });
+        dynCull = cull;
     }
 
     void setRenderTarget(VKImage img, boolean depth) {
@@ -1247,38 +1365,44 @@ final class VKDevice {
         return samplers[linear ? 1 : 0][wrap];
     }
 
+    /** Pushes the uniform block, at an offset of the ring, and the sampled images. */
     private void pushDescriptors(long uniformOffset, long uniformSize, VKImage[] images, long[] imageSamplers) {
         MemorySegment writes = VkWriteDescriptorSet.allocateArray(scratch, 1 + MAX_TEXTURE_UNITS);
         int count = 0;
         if (uniformSize > 0) {
-            MemorySegment bufferInfo = VkDescriptorBufferInfo.allocate(scratch);
-            VkDescriptorBufferInfo.buffer(bufferInfo, ringBuffer);
-            VkDescriptorBufferInfo.offset(bufferInfo, uniformOffset);
-            VkDescriptorBufferInfo.range(bufferInfo, uniformSize);
-            MemorySegment w = VkWriteDescriptorSet.at(writes, count++);
-            VkWriteDescriptorSet.dstBinding(w, UNIFORM_BINDING);
-            VkWriteDescriptorSet.descriptorCount(w, 1);
-            VkWriteDescriptorSet.descriptorType(w, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-            VkWriteDescriptorSet.pBufferInfo(w, bufferInfo);
+            uniformWrite(VkWriteDescriptorSet.at(writes, count++), uniformOffset, uniformSize);
         }
         for (int i = 0; i < MAX_TEXTURE_UNITS; i++) {
-            VKImage img = images[i];
-            if (img == null) {
-                continue;
+            if (images[i] != null) {
+                imageWrite(VkWriteDescriptorSet.at(writes, count++), FIRST_SAMPLER_BINDING + i,
+                        images[i], imageSamplers[i]);
             }
-            MemorySegment imageInfo = VkDescriptorImageInfo.allocate(scratch);
-            VkDescriptorImageInfo.sampler(imageInfo, imageSamplers[i]);
-            VkDescriptorImageInfo.imageView(imageInfo, img.view);
-            VkDescriptorImageInfo.imageLayout(imageInfo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            MemorySegment w = VkWriteDescriptorSet.at(writes, count++);
-            VkWriteDescriptorSet.dstBinding(w, FIRST_SAMPLER_BINDING + i);
-            VkWriteDescriptorSet.descriptorCount(w, 1);
-            VkWriteDescriptorSet.descriptorType(w, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-            VkWriteDescriptorSet.pImageInfo(w, imageInfo);
         }
         if (count > 0) {
             vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, count, writes);
         }
+    }
+
+    private void uniformWrite(MemorySegment w, long offset, long size) {
+        MemorySegment bufferInfo = VkDescriptorBufferInfo.allocate(scratch);
+        VkDescriptorBufferInfo.buffer(bufferInfo, ringBuffer);
+        VkDescriptorBufferInfo.offset(bufferInfo, offset);
+        VkDescriptorBufferInfo.range(bufferInfo, size);
+        VkWriteDescriptorSet.dstBinding(w, UNIFORM_BINDING);
+        VkWriteDescriptorSet.descriptorCount(w, 1);
+        VkWriteDescriptorSet.descriptorType(w, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        VkWriteDescriptorSet.pBufferInfo(w, bufferInfo);
+    }
+
+    private void imageWrite(MemorySegment w, int binding, VKImage img, long sampler) {
+        MemorySegment imageInfo = VkDescriptorImageInfo.allocate(scratch);
+        VkDescriptorImageInfo.sampler(imageInfo, sampler);
+        VkDescriptorImageInfo.imageView(imageInfo, img.view);
+        VkDescriptorImageInfo.imageLayout(imageInfo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        VkWriteDescriptorSet.dstBinding(w, binding);
+        VkWriteDescriptorSet.descriptorCount(w, 1);
+        VkWriteDescriptorSet.descriptorType(w, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        VkWriteDescriptorSet.pImageInfo(w, imageInfo);
     }
 
     void drawQuads(float[] coords, byte[] colors, int numVertices) {
@@ -1287,61 +1411,76 @@ final class VKDevice {
             return;
         }
         // The sampled textures must be readable; this ends the rendering
-        for (int i = 0; i < MAX_TEXTURE_UNITS; i++) {
-            VKImage tex = textures[i];
+        makeTexturesReadable();
+        QuadData data = uploadQuads(s, coords, colors, numVertices);
+        if (data == null || !beginRendering()) {
+            return;
+        }
+        long pipeline = s.getPipeline(compositeMode, target.hasDepth(), target.sampleIndex());
+        if (pipeline != 0L) {
+            recordQuads(pipeline, data, s.getBlockSize(), numVertices);
+        }
+    }
+
+    /** Where the data of a draw of quads is in the ring. */
+    private record QuadData(long vertexOffset, long colorOffset, long uniformOffset) {}
+
+    private void makeTexturesReadable() {
+        for (VKImage tex : textures) {
             if (tex != null && tex != target) {
                 transition(tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
         }
+    }
 
-        int blockSize = s.getBlockSize();
+    /**
+     * Copies the vertices, the colors and the uniform block of a draw into the
+     * ring, after submitting the frame when its half of the ring is full.
+     *
+     * @return where they are, or null when they do not fit even an empty ring
+     */
+    private QuadData uploadQuads(VKShader s, float[] coords, byte[] colors, int numVertices) {
         long vertexBytes = (long) numVertices * VERTEX_SIZE;
         long colorBytes = (long) numVertices * 4;
-        long vertexOffset = -1;
-        long colorOffset = -1;
-        long uniformOffset = 0;
-        for (int attempt = 0; ; attempt++) {
-            long saved = ringOffset;
-            vertexOffset = ringAlloc(vertexBytes, 4);
-            colorOffset = ringAlloc(colorBytes, 4);
-            if (blockSize > 0) {
-                uniformOffset = ringAlloc(blockSize, minUniformAlignment);
-            }
-            if (vertexOffset >= 0 && colorOffset >= 0 && uniformOffset >= 0) {
-                break;
-            }
-            ringOffset = saved;
-            if (attempt > 0) {
-                System.err.println("Prism VK error: draw data does not fit the ring buffer");
-                return;
-            }
+        int blockSize = s.getBlockSize();
+        QuadData data = allocateQuads(vertexBytes, colorBytes, blockSize);
+        if (data == null) {
             submit(0L);
+            data = allocateQuads(vertexBytes, colorBytes, blockSize);
         }
-        MemorySegment.copy(coords, 0, ringMapped, JAVA_FLOAT, vertexOffset, numVertices * VERTEX_FLOATS);
-        MemorySegment.copy(colors, 0, ringMapped, JAVA_BYTE, colorOffset, numVertices * 4);
+        if (data == null) {
+            System.err.println("Prism VK error: draw data does not fit the ring buffer");
+            return null;
+        }
+        MemorySegment.copy(coords, 0, ringMapped, JAVA_FLOAT, data.vertexOffset(), numVertices * VERTEX_FLOATS);
+        MemorySegment.copy(colors, 0, ringMapped, JAVA_BYTE, data.colorOffset(), numVertices * 4);
         if (blockSize > 0) {
-            MemorySegment.copy(s.getUniforms(), 0, ringMapped, uniformOffset, blockSize);
+            MemorySegment.copy(s.getUniforms(), 0, ringMapped, data.uniformOffset(), blockSize);
         }
+        return data;
+    }
 
-        if (!beginRendering()) {
-            return;
+    private QuadData allocateQuads(long vertexBytes, long colorBytes, int blockSize) {
+        long saved = ringOffset;
+        long vertexOffset = ringAlloc(vertexBytes, 4);
+        long colorOffset = ringAlloc(colorBytes, 4);
+        long uniformOffset = blockSize > 0 ? ringAlloc(blockSize, minUniformAlignment) : 0;
+        if (vertexOffset < 0 || colorOffset < 0 || uniformOffset < 0) {
+            ringOffset = saved;
+            return null;
         }
-        long pipeline = s.getPipeline(compositeMode, target.hasDepth(), target.sampleIndex());
-        if (pipeline == 0L) {
-            return;
-        }
+        return new QuadData(vertexOffset, colorOffset, uniformOffset);
+    }
+
+    private void recordQuads(long pipeline, QuadData data, int blockSize, int numVertices) {
         long mark = scratch.mark();
         try {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            pushDescriptors(uniformOffset, blockSize, textures, textureSamplers);
+            pushDescriptors(data.uniformOffset(), blockSize, textures, textureSamplers);
             vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, transform);
             setDrawState(true, CULL_NONE);
-            MemorySegment buffers = scratch.allocate(JAVA_LONG, 2);
-            buffers.setAtIndex(JAVA_LONG, 0, ringBuffer);
-            buffers.setAtIndex(JAVA_LONG, 1, ringBuffer);
-            MemorySegment offsets = scratch.allocate(JAVA_LONG, 2);
-            offsets.setAtIndex(JAVA_LONG, 0, vertexOffset);
-            offsets.setAtIndex(JAVA_LONG, 1, colorOffset);
+            MemorySegment buffers = scratch.allocateFrom(JAVA_LONG, ringBuffer, ringBuffer);
+            MemorySegment offsets = scratch.allocateFrom(JAVA_LONG, data.vertexOffset(), data.colorOffset());
             vkCmdBindVertexBuffers(cmd, 0, 2, buffers, offsets);
             vkCmdBindIndexBuffer(cmd, quadIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
             int numQuads = Math.min(numVertices / 4, MAX_QUADS);
@@ -1366,23 +1505,28 @@ final class VKDevice {
                 return;
             }
             boolean depth = clearDepth && target.hasDepth();
-            MemorySegment attachments = VkClearAttachment.allocateArray(scratch, depth ? 2 : 1);
-            MemorySegment c = VkClearAttachment.at(attachments, 0);
-            VkClearAttachment.aspectMask(c, VK_IMAGE_ASPECT_COLOR_BIT);
-            MemorySegment color = VkClearValue.color(VkClearAttachment.clearValue(c));
-            VkClearColorValue.float32(color, 0, r);
-            VkClearColorValue.float32(color, 1, g);
-            VkClearColorValue.float32(color, 2, b);
-            VkClearColorValue.float32(color, 3, a);
-            if (depth) {
-                MemorySegment d = VkClearAttachment.at(attachments, 1);
-                VkClearAttachment.aspectMask(d, VK_IMAGE_ASPECT_DEPTH_BIT);
-                VkClearDepthStencilValue.depth(VkClearValue.depthStencil(VkClearAttachment.clearValue(d)), 1.0f);
-            }
-            vkCmdClearAttachments(cmd, depth ? 2 : 1, attachments, 1, rect);
+            vkCmdClearAttachments(cmd, depth ? 2 : 1, clearAttachments(r, g, b, a, depth), 1, rect);
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /** The color to clear to, and the far plane for the depth buffer. */
+    private MemorySegment clearAttachments(float r, float g, float b, float a, boolean depth) {
+        MemorySegment attachments = VkClearAttachment.allocateArray(scratch, depth ? 2 : 1);
+        MemorySegment c = VkClearAttachment.at(attachments, 0);
+        VkClearAttachment.aspectMask(c, VK_IMAGE_ASPECT_COLOR_BIT);
+        MemorySegment color = VkClearValue.color(VkClearAttachment.clearValue(c));
+        float[] rgba = {r, g, b, a};
+        for (int i = 0; i < rgba.length; i++) {
+            VkClearColorValue.float32(color, i, rgba[i]);
+        }
+        if (depth) {
+            MemorySegment d = VkClearAttachment.at(attachments, 1);
+            VkClearAttachment.aspectMask(d, VK_IMAGE_ASPECT_DEPTH_BIT);
+            VkClearDepthStencilValue.depth(VkClearValue.depthStencil(VkClearAttachment.clearValue(d)), 1.0f);
+        }
+        return attachments;
     }
 
     void blit(VKImage src, VKImage dst, int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1) {
@@ -1390,45 +1534,58 @@ final class VKDevice {
             return;
         }
         if (src.samples > 1) {
-            boolean exact = sx0 == dx0 && sy0 == dy0 && sx1 == dx1 && sy1 == dy1
-                    && sx1 > sx0 && sy1 > sy0 && dst.samples == 1;
-            if (exact) {
-                resolve(src, dst, sx0, sy0, sx1 - sx0, sy1 - sy0);
-                return;
-            }
-            // Resolve into a temporary image, then scale or move it
-            VKImage resolved = createImage(VKImage.FORMAT_BGRA8, src.width, src.height, 1, true, false);
-            if (resolved == null) {
-                return;
-            }
-            resolve(src, resolved, 0, 0, src.width, src.height);
-            blit(resolved, dst, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
-            resolved.dispose();
+            blitMultisampled(src, dst, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
             return;
         }
         transition(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         transition(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         long mark = scratch.mark();
         try {
-            MemorySegment region = VkImageBlit.allocate(scratch);
-            subresourceLayers(VkImageBlit.srcSubresource(region));
-            subresourceLayers(VkImageBlit.dstSubresource(region));
-            MemorySegment so = VkImageBlit.srcOffsets(region);
-            offset3D(VkOffset3D.at(so, 0), sx0, sy0, 0);
-            offset3D(VkOffset3D.at(so, 1), sx1, sy1, 1);
-            MemorySegment d = VkImageBlit.dstOffsets(region);
-            offset3D(VkOffset3D.at(d, 0), dx0, dy0, 0);
-            offset3D(VkOffset3D.at(d, 1), dx1, dy1, 1);
             boolean sameSize = Math.abs(sx1 - sx0) == Math.abs(dx1 - dx0)
                     && Math.abs(sy1 - sy0) == Math.abs(dy1 - dy0);
             vkCmdBlitImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, region,
+                    dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                    blitRegion(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1),
                     sameSize ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
         } finally {
             scratch.reset(mark);
         }
         transition(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         transition(dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    /**
+     * Blits a multisampled image: a resolve when nothing moves or scales, or
+     * else a resolve into a temporary image which is then blitted.
+     */
+    private void blitMultisampled(VKImage src, VKImage dst, int sx0, int sy0, int sx1, int sy1,
+                                  int dx0, int dy0, int dx1, int dy1) {
+        boolean exact = sx0 == dx0 && sy0 == dy0 && sx1 == dx1 && sy1 == dy1
+                && sx1 > sx0 && sy1 > sy0 && dst.samples == 1;
+        if (exact) {
+            resolve(src, dst, sx0, sy0, sx1 - sx0, sy1 - sy0);
+            return;
+        }
+        VKImage resolved = createImage(VKImage.FORMAT_BGRA8, src.width, src.height, 1, true, false);
+        if (resolved == null) {
+            return;
+        }
+        resolve(src, resolved, 0, 0, src.width, src.height);
+        blit(resolved, dst, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
+        resolved.dispose();
+    }
+
+    private MemorySegment blitRegion(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1) {
+        MemorySegment region = VkImageBlit.allocate(scratch);
+        subresourceLayers(VkImageBlit.srcSubresource(region));
+        subresourceLayers(VkImageBlit.dstSubresource(region));
+        MemorySegment so = VkImageBlit.srcOffsets(region);
+        offset3D(VkOffset3D.at(so, 0), sx0, sy0, 0);
+        offset3D(VkOffset3D.at(so, 1), sx1, sy1, 1);
+        MemorySegment d = VkImageBlit.dstOffsets(region);
+        offset3D(VkOffset3D.at(d, 0), dx0, dy0, 0);
+        offset3D(VkOffset3D.at(d, 1), dx1, dy1, 1);
+        return region;
     }
 
     private static void offset3D(MemorySegment o, int x, int y, int z) {
@@ -1927,109 +2084,18 @@ final class VKDevice {
                         int mode, boolean depth, int sampleIndex, boolean wireframe) {
         long mark = scratch.mark();
         try {
-            MemorySegment main = scratch.allocateFrom("main");
-            MemorySegment stages = VkPipelineShaderStageCreateInfo.allocateArray(scratch, 2);
-            MemorySegment vs = VkPipelineShaderStageCreateInfo.at(stages, 0);
-            VkPipelineShaderStageCreateInfo.stage(vs, VK_SHADER_STAGE_VERTEX_BIT);
-            VkPipelineShaderStageCreateInfo.module(vs, vertex);
-            VkPipelineShaderStageCreateInfo.pName(vs, main);
-            MemorySegment fs = VkPipelineShaderStageCreateInfo.at(stages, 1);
-            VkPipelineShaderStageCreateInfo.stage(fs, VK_SHADER_STAGE_FRAGMENT_BIT);
-            VkPipelineShaderStageCreateInfo.module(fs, fragment);
-            VkPipelineShaderStageCreateInfo.pName(fs, main);
-            if (specialization != null) {
-                MemorySegment entries = VkSpecializationMapEntry.allocateArray(scratch, specialization.length);
-                MemorySegment data = scratch.allocate(JAVA_INT, specialization.length);
-                for (int i = 0; i < specialization.length; i++) {
-                    MemorySegment e = VkSpecializationMapEntry.at(entries, i);
-                    VkSpecializationMapEntry.constantID(e, i);
-                    VkSpecializationMapEntry.offset(e, i * 4);
-                    VkSpecializationMapEntry.size(e, 4);
-                    data.setAtIndex(JAVA_INT, i, specialization[i]);
-                }
-                MemorySegment spec = VkSpecializationInfo.allocate(scratch);
-                VkSpecializationInfo.mapEntryCount(spec, specialization.length);
-                VkSpecializationInfo.pMapEntries(spec, entries);
-                VkSpecializationInfo.dataSize(spec, specialization.length * 4L);
-                VkSpecializationInfo.pData(spec, data);
-                VkPipelineShaderStageCreateInfo.pSpecializationInfo(fs, spec);
-            }
-
-            MemorySegment vertexInput = VkPipelineVertexInputStateCreateInfo.allocate(scratch);
-            if (mesh) {
-                MemorySegment bindings = VkVertexInputBindingDescription.allocateArray(scratch, 1);
-                vertexBinding(bindings, 0, MESH_VERTEX_FLOATS * 4);
-                MemorySegment attrs = VkVertexInputAttributeDescription.allocateArray(scratch, 3);
-                vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 0), 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0);
-                vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 1), 1, 0, VK_FORMAT_R32G32_SFLOAT, 12);
-                vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 2), 2, 0,
-                        VK_FORMAT_R32G32B32A32_SFLOAT, 20);
-                VkPipelineVertexInputStateCreateInfo.vertexBindingDescriptionCount(vertexInput, 1);
-                VkPipelineVertexInputStateCreateInfo.pVertexBindingDescriptions(vertexInput, bindings);
-                VkPipelineVertexInputStateCreateInfo.vertexAttributeDescriptionCount(vertexInput, 3);
-                VkPipelineVertexInputStateCreateInfo.pVertexAttributeDescriptions(vertexInput, attrs);
-            } else {
-                MemorySegment bindings = VkVertexInputBindingDescription.allocateArray(scratch, 2);
-                vertexBinding(VkVertexInputBindingDescription.at(bindings, 0), 0, VERTEX_SIZE);
-                vertexBinding(VkVertexInputBindingDescription.at(bindings, 1), 1, 4);
-                MemorySegment attrs = VkVertexInputAttributeDescription.allocateArray(scratch, 4);
-                vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 0), 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0);
-                vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 1), 1, 0, VK_FORMAT_R32G32_SFLOAT, 12);
-                vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 2), 2, 0, VK_FORMAT_R32G32_SFLOAT, 20);
-                vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 3), 3, 1, VK_FORMAT_R8G8B8A8_UNORM, 0);
-                VkPipelineVertexInputStateCreateInfo.vertexBindingDescriptionCount(vertexInput, 2);
-                VkPipelineVertexInputStateCreateInfo.pVertexBindingDescriptions(vertexInput, bindings);
-                VkPipelineVertexInputStateCreateInfo.vertexAttributeDescriptionCount(vertexInput, 4);
-                VkPipelineVertexInputStateCreateInfo.pVertexAttributeDescriptions(vertexInput, attrs);
-            }
-            MemorySegment inputAssembly = VkPipelineInputAssemblyStateCreateInfo.allocate(scratch);
-            VkPipelineInputAssemblyStateCreateInfo.topology(inputAssembly, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-            MemorySegment viewport = VkPipelineViewportStateCreateInfo.allocate(scratch);
-            VkPipelineViewportStateCreateInfo.viewportCount(viewport, 1);
-            VkPipelineViewportStateCreateInfo.scissorCount(viewport, 1);
-            MemorySegment raster = VkPipelineRasterizationStateCreateInfo.allocate(scratch);
-            VkPipelineRasterizationStateCreateInfo.polygonMode(raster,
-                    wireframe && fillModeNonSolid ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL);
-            VkPipelineRasterizationStateCreateInfo.cullMode(raster, VK_CULL_MODE_NONE);
-            VkPipelineRasterizationStateCreateInfo.frontFace(raster, VK_FRONT_FACE_COUNTER_CLOCKWISE);
-            VkPipelineRasterizationStateCreateInfo.lineWidth(raster, 1.0f);
-            MemorySegment multisample = VkPipelineMultisampleStateCreateInfo.allocate(scratch);
-            VkPipelineMultisampleStateCreateInfo.rasterizationSamples(multisample, 1 << sampleIndex);
-            MemorySegment depthStencil = VkPipelineDepthStencilStateCreateInfo.allocate(scratch);
-            VkPipelineDepthStencilStateCreateInfo.depthCompareOp(depthStencil, VK_COMPARE_OP_LESS_OR_EQUAL);
-            VkPipelineDepthStencilStateCreateInfo.maxDepthBounds(depthStencil, 1.0f);
-            MemorySegment blendAttachment = VkPipelineColorBlendAttachmentState.allocate(scratch);
-            blendState(blendAttachment, mode);
-            MemorySegment blend = VkPipelineColorBlendStateCreateInfo.allocate(scratch);
-            VkPipelineColorBlendStateCreateInfo.attachmentCount(blend, 1);
-            VkPipelineColorBlendStateCreateInfo.pAttachments(blend, blendAttachment);
-            int[] states = {
-                VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
-                VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
-                VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE
-            };
-            MemorySegment dynamicStates = scratch.allocateFrom(JAVA_INT, states);
-            MemorySegment dynamic = VkPipelineDynamicStateCreateInfo.allocate(scratch);
-            VkPipelineDynamicStateCreateInfo.dynamicStateCount(dynamic, states.length);
-            VkPipelineDynamicStateCreateInfo.pDynamicStates(dynamic, dynamicStates);
-            MemorySegment colorFormat = scratch.allocateFrom(JAVA_INT, VK_FORMAT_B8G8R8A8_UNORM);
-            MemorySegment rendering = VkPipelineRenderingCreateInfo.allocate(scratch);
-            VkPipelineRenderingCreateInfo.colorAttachmentCount(rendering, 1);
-            VkPipelineRenderingCreateInfo.pColorAttachmentFormats(rendering, colorFormat);
-            VkPipelineRenderingCreateInfo.depthAttachmentFormat(rendering, depth ? depthFormat : VK_FORMAT_UNDEFINED);
-
             MemorySegment info = VkGraphicsPipelineCreateInfo.allocate(scratch);
-            VkGraphicsPipelineCreateInfo.pNext(info, rendering);
+            VkGraphicsPipelineCreateInfo.pNext(info, renderingFormats(depth));
             VkGraphicsPipelineCreateInfo.stageCount(info, 2);
-            VkGraphicsPipelineCreateInfo.pStages(info, stages);
-            VkGraphicsPipelineCreateInfo.pVertexInputState(info, vertexInput);
-            VkGraphicsPipelineCreateInfo.pInputAssemblyState(info, inputAssembly);
-            VkGraphicsPipelineCreateInfo.pViewportState(info, viewport);
-            VkGraphicsPipelineCreateInfo.pRasterizationState(info, raster);
-            VkGraphicsPipelineCreateInfo.pMultisampleState(info, multisample);
-            VkGraphicsPipelineCreateInfo.pDepthStencilState(info, depthStencil);
-            VkGraphicsPipelineCreateInfo.pColorBlendState(info, blend);
-            VkGraphicsPipelineCreateInfo.pDynamicState(info, dynamic);
+            VkGraphicsPipelineCreateInfo.pStages(info, shaderStages(vertex, fragment, specialization));
+            VkGraphicsPipelineCreateInfo.pVertexInputState(info, mesh ? meshVertexInput() : quadVertexInput());
+            VkGraphicsPipelineCreateInfo.pInputAssemblyState(info, triangleList());
+            VkGraphicsPipelineCreateInfo.pViewportState(info, oneViewport());
+            VkGraphicsPipelineCreateInfo.pRasterizationState(info, rasterization(wireframe));
+            VkGraphicsPipelineCreateInfo.pMultisampleState(info, multisample(sampleIndex));
+            VkGraphicsPipelineCreateInfo.pDepthStencilState(info, depthStencil());
+            VkGraphicsPipelineCreateInfo.pColorBlendState(info, colorBlend(mode));
+            VkGraphicsPipelineCreateInfo.pDynamicState(info, dynamicStates());
             VkGraphicsPipelineCreateInfo.layout(info, pipelineLayout);
             MemorySegment p = scratch.allocate(JAVA_LONG);
             int result = vkCreateGraphicsPipelines(device, 0L, 1, info, MemorySegment.NULL, p);
@@ -2041,6 +2107,145 @@ final class VKDevice {
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /** The vertex and fragment stages, the fragment one with its specialization constants. */
+    private MemorySegment shaderStages(long vertex, long fragment, int[] specialization) {
+        MemorySegment main = scratch.allocateFrom("main");
+        MemorySegment stages = VkPipelineShaderStageCreateInfo.allocateArray(scratch, 2);
+        MemorySegment vs = VkPipelineShaderStageCreateInfo.at(stages, 0);
+        VkPipelineShaderStageCreateInfo.stage(vs, VK_SHADER_STAGE_VERTEX_BIT);
+        VkPipelineShaderStageCreateInfo.module(vs, vertex);
+        VkPipelineShaderStageCreateInfo.pName(vs, main);
+        MemorySegment fs = VkPipelineShaderStageCreateInfo.at(stages, 1);
+        VkPipelineShaderStageCreateInfo.stage(fs, VK_SHADER_STAGE_FRAGMENT_BIT);
+        VkPipelineShaderStageCreateInfo.module(fs, fragment);
+        VkPipelineShaderStageCreateInfo.pName(fs, main);
+        if (specialization != null) {
+            VkPipelineShaderStageCreateInfo.pSpecializationInfo(fs, specializationInfo(specialization));
+        }
+        return stages;
+    }
+
+    /** Specialization constants 0, 1, 2...: one int each. */
+    private MemorySegment specializationInfo(int[] constants) {
+        MemorySegment entries = VkSpecializationMapEntry.allocateArray(scratch, constants.length);
+        for (int i = 0; i < constants.length; i++) {
+            MemorySegment e = VkSpecializationMapEntry.at(entries, i);
+            VkSpecializationMapEntry.constantID(e, i);
+            VkSpecializationMapEntry.offset(e, i * 4);
+            VkSpecializationMapEntry.size(e, 4);
+        }
+        MemorySegment spec = VkSpecializationInfo.allocate(scratch);
+        VkSpecializationInfo.mapEntryCount(spec, constants.length);
+        VkSpecializationInfo.pMapEntries(spec, entries);
+        VkSpecializationInfo.dataSize(spec, constants.length * 4L);
+        VkSpecializationInfo.pData(spec, scratch.allocateFrom(JAVA_INT, constants));
+        return spec;
+    }
+
+    /** Mesh vertices: position, texture coordinates and the tangent frame quaternion. */
+    private MemorySegment meshVertexInput() {
+        MemorySegment bindings = VkVertexInputBindingDescription.allocateArray(scratch, 1);
+        vertexBinding(bindings, 0, MESH_VERTEX_FLOATS * 4);
+        MemorySegment attrs = VkVertexInputAttributeDescription.allocateArray(scratch, 3);
+        vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 0), 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0);
+        vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 1), 1, 0, VK_FORMAT_R32G32_SFLOAT, 12);
+        vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 2), 2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 20);
+        return vertexInput(bindings, 1, attrs, 3);
+    }
+
+    /** Quad vertices: position and two texture coordinates, and a color from a second buffer. */
+    private MemorySegment quadVertexInput() {
+        MemorySegment bindings = VkVertexInputBindingDescription.allocateArray(scratch, 2);
+        vertexBinding(VkVertexInputBindingDescription.at(bindings, 0), 0, VERTEX_SIZE);
+        vertexBinding(VkVertexInputBindingDescription.at(bindings, 1), 1, 4);
+        MemorySegment attrs = VkVertexInputAttributeDescription.allocateArray(scratch, 4);
+        vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 0), 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0);
+        vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 1), 1, 0, VK_FORMAT_R32G32_SFLOAT, 12);
+        vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 2), 2, 0, VK_FORMAT_R32G32_SFLOAT, 20);
+        vertexAttribute(VkVertexInputAttributeDescription.at(attrs, 3), 3, 1, VK_FORMAT_R8G8B8A8_UNORM, 0);
+        return vertexInput(bindings, 2, attrs, 4);
+    }
+
+    private MemorySegment vertexInput(MemorySegment bindings, int bindingCount, MemorySegment attrs, int attrCount) {
+        MemorySegment vertexInput = VkPipelineVertexInputStateCreateInfo.allocate(scratch);
+        VkPipelineVertexInputStateCreateInfo.vertexBindingDescriptionCount(vertexInput, bindingCount);
+        VkPipelineVertexInputStateCreateInfo.pVertexBindingDescriptions(vertexInput, bindings);
+        VkPipelineVertexInputStateCreateInfo.vertexAttributeDescriptionCount(vertexInput, attrCount);
+        VkPipelineVertexInputStateCreateInfo.pVertexAttributeDescriptions(vertexInput, attrs);
+        return vertexInput;
+    }
+
+    private MemorySegment triangleList() {
+        MemorySegment inputAssembly = VkPipelineInputAssemblyStateCreateInfo.allocate(scratch);
+        VkPipelineInputAssemblyStateCreateInfo.topology(inputAssembly, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        return inputAssembly;
+    }
+
+    /** One viewport and one scissor, both dynamic. */
+    private MemorySegment oneViewport() {
+        MemorySegment viewport = VkPipelineViewportStateCreateInfo.allocate(scratch);
+        VkPipelineViewportStateCreateInfo.viewportCount(viewport, 1);
+        VkPipelineViewportStateCreateInfo.scissorCount(viewport, 1);
+        return viewport;
+    }
+
+    /** Filled triangles, or their edges for a wireframe when the device can draw them. */
+    private MemorySegment rasterization(boolean wireframe) {
+        MemorySegment raster = VkPipelineRasterizationStateCreateInfo.allocate(scratch);
+        VkPipelineRasterizationStateCreateInfo.polygonMode(raster,
+                wireframe && fillModeNonSolid ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL);
+        VkPipelineRasterizationStateCreateInfo.cullMode(raster, VK_CULL_MODE_NONE);
+        VkPipelineRasterizationStateCreateInfo.frontFace(raster, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        VkPipelineRasterizationStateCreateInfo.lineWidth(raster, 1.0f);
+        return raster;
+    }
+
+    private MemorySegment multisample(int sampleIndex) {
+        MemorySegment multisample = VkPipelineMultisampleStateCreateInfo.allocate(scratch);
+        VkPipelineMultisampleStateCreateInfo.rasterizationSamples(multisample, 1 << sampleIndex);
+        return multisample;
+    }
+
+    /** The depth comparison; the test and the writes are dynamic. */
+    private MemorySegment depthStencil() {
+        MemorySegment depthStencil = VkPipelineDepthStencilStateCreateInfo.allocate(scratch);
+        VkPipelineDepthStencilStateCreateInfo.depthCompareOp(depthStencil, VK_COMPARE_OP_LESS_OR_EQUAL);
+        VkPipelineDepthStencilStateCreateInfo.maxDepthBounds(depthStencil, 1.0f);
+        return depthStencil;
+    }
+
+    private MemorySegment colorBlend(int mode) {
+        MemorySegment blendAttachment = VkPipelineColorBlendAttachmentState.allocate(scratch);
+        blendState(blendAttachment, mode);
+        MemorySegment blend = VkPipelineColorBlendStateCreateInfo.allocate(scratch);
+        VkPipelineColorBlendStateCreateInfo.attachmentCount(blend, 1);
+        VkPipelineColorBlendStateCreateInfo.pAttachments(blend, blendAttachment);
+        return blend;
+    }
+
+    private static final int[] DYNAMIC_STATES = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+        VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE
+    };
+
+    private MemorySegment dynamicStates() {
+        MemorySegment dynamic = VkPipelineDynamicStateCreateInfo.allocate(scratch);
+        VkPipelineDynamicStateCreateInfo.dynamicStateCount(dynamic, DYNAMIC_STATES.length);
+        VkPipelineDynamicStateCreateInfo.pDynamicStates(dynamic, scratch.allocateFrom(JAVA_INT, DYNAMIC_STATES));
+        return dynamic;
+    }
+
+    /** The formats of the attachments of dynamic rendering: BGRA, and the depth buffer if any. */
+    private MemorySegment renderingFormats(boolean depth) {
+        MemorySegment rendering = VkPipelineRenderingCreateInfo.allocate(scratch);
+        VkPipelineRenderingCreateInfo.colorAttachmentCount(rendering, 1);
+        VkPipelineRenderingCreateInfo.pColorAttachmentFormats(rendering,
+                scratch.allocateFrom(JAVA_INT, VK_FORMAT_B8G8R8A8_UNORM));
+        VkPipelineRenderingCreateInfo.depthAttachmentFormat(rendering, depth ? depthFormat : VK_FORMAT_UNDEFINED);
+        return rendering;
     }
 
     long createQuadPipeline(long fragment, int mode, boolean depth, int sampleIndex) {
