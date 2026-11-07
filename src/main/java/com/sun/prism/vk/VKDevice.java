@@ -709,34 +709,11 @@ final class VKDevice {
             if (frames[0] != null) {
                 flush();
             }
-            if (dummyTexture != null) {
-                destroyImageNow(dummyTexture);
+            destroyRenderingObjects();
+            destroyBuffers();
+            if (presentSemaphore != 0L) {
+                vkDestroySemaphore(device, presentSemaphore, MemorySegment.NULL);
             }
-            for (long pipeline : phongPipelines.values()) {
-                vkDestroyPipeline(device, pipeline, MemorySegment.NULL);
-            }
-            destroyModule(phongVertexModule);
-            destroyModule(phongFragmentModule);
-            for (long[] row : samplers) {
-                for (long s : row) {
-                    if (s != 0L) {
-                        vkDestroySampler(device, s, MemorySegment.NULL);
-                    }
-                }
-            }
-            destroyModule(vertexModule);
-            if (pipelineLayout != 0L) vkDestroyPipelineLayout(device, pipelineLayout, MemorySegment.NULL);
-            if (setLayout != 0L) vkDestroyDescriptorSetLayout(device, setLayout, MemorySegment.NULL);
-            destroyBuffer(quadIndexBuffer, quadIndexMemory);
-            destroyBuffer(ringBuffer, ringMemory);
-            for (Frame frame : frames) {
-                if (frame != null) {
-                    destroyBuffer(frame.stagingBuffer, frame.stagingMemory);
-                    if (frame.fence != 0L) vkDestroyFence(device, frame.fence, MemorySegment.NULL);
-                    if (frame.commandPool != 0L) vkDestroyCommandPool(device, frame.commandPool, MemorySegment.NULL);
-                }
-            }
-            if (presentSemaphore != 0L) vkDestroySemaphore(device, presentSemaphore, MemorySegment.NULL);
             vkDestroyDevice(device, MemorySegment.NULL);
             device = 0L;
         }
@@ -746,6 +723,49 @@ final class VKDevice {
         }
         scratch.close();
         arena.close();
+    }
+
+    /** The pipelines, the shaders, the samplers and the layouts. */
+    private void destroyRenderingObjects() {
+        if (dummyTexture != null) {
+            destroyImageNow(dummyTexture);
+        }
+        for (long pipeline : phongPipelines.values()) {
+            vkDestroyPipeline(device, pipeline, MemorySegment.NULL);
+        }
+        destroyModule(phongVertexModule);
+        destroyModule(phongFragmentModule);
+        for (long[] row : samplers) {
+            for (long s : row) {
+                if (s != 0L) {
+                    vkDestroySampler(device, s, MemorySegment.NULL);
+                }
+            }
+        }
+        destroyModule(vertexModule);
+        if (pipelineLayout != 0L) {
+            vkDestroyPipelineLayout(device, pipelineLayout, MemorySegment.NULL);
+        }
+        if (setLayout != 0L) {
+            vkDestroyDescriptorSetLayout(device, setLayout, MemorySegment.NULL);
+        }
+    }
+
+    /** The quad indices, the ring and the frames with their staging buffers. */
+    private void destroyBuffers() {
+        destroyBuffer(quadIndexBuffer, quadIndexMemory);
+        destroyBuffer(ringBuffer, ringMemory);
+        for (Frame frame : frames) {
+            if (frame != null) {
+                destroyBuffer(frame.stagingBuffer, frame.stagingMemory);
+                if (frame.fence != 0L) {
+                    vkDestroyFence(device, frame.fence, MemorySegment.NULL);
+                }
+                if (frame.commandPool != 0L) {
+                    vkDestroyCommandPool(device, frame.commandPool, MemorySegment.NULL);
+                }
+            }
+        }
     }
 
     private void destroyModule(long module) {
@@ -800,26 +820,34 @@ final class VKDevice {
             MemorySegment p = scratch.allocate(JAVA_LONG);
             check(vkCreateBuffer(device, info, MemorySegment.NULL, p), "vkCreateBuffer");
             long buffer = handle(p);
-            MemorySegment req = VkMemoryRequirements.allocate(scratch);
-            vkGetBufferMemoryRequirements(device, buffer, req);
-            int type = findMemoryType(VkMemoryRequirements.memoryTypeBits(req), flags);
-            if (type < 0) {
+            try {
+                long memory = allocateBufferMemory(buffer, size, flags);
+                vkBindBufferMemory(device, buffer, memory, 0);
+                return new long[] {buffer, memory};
+            } catch (VKException e) {
                 vkDestroyBuffer(device, buffer, MemorySegment.NULL);
-                throw new VKException("no memory type for a buffer");
+                throw e;
             }
-            MemorySegment alloc = VkMemoryAllocateInfo.allocate(scratch);
-            VkMemoryAllocateInfo.allocationSize(alloc, VkMemoryRequirements.size(req));
-            VkMemoryAllocateInfo.memoryTypeIndex(alloc, type);
-            if (vkAllocateMemory(device, alloc, MemorySegment.NULL, p) != VK_SUCCESS) {
-                vkDestroyBuffer(device, buffer, MemorySegment.NULL);
-                throw new VKException("cannot allocate " + size + " bytes for a buffer");
-            }
-            long memory = handle(p);
-            vkBindBufferMemory(device, buffer, memory, 0);
-            return new long[] { buffer, memory };
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    private long allocateBufferMemory(long buffer, long size, int flags) {
+        MemorySegment req = VkMemoryRequirements.allocate(scratch);
+        vkGetBufferMemoryRequirements(device, buffer, req);
+        int type = findMemoryType(VkMemoryRequirements.memoryTypeBits(req), flags);
+        if (type < 0) {
+            throw new VKException("no memory type for a buffer");
+        }
+        MemorySegment alloc = VkMemoryAllocateInfo.allocate(scratch);
+        VkMemoryAllocateInfo.allocationSize(alloc, VkMemoryRequirements.size(req));
+        VkMemoryAllocateInfo.memoryTypeIndex(alloc, type);
+        MemorySegment p = scratch.allocate(JAVA_LONG);
+        if (vkAllocateMemory(device, alloc, MemorySegment.NULL, p) != VK_SUCCESS) {
+            throw new VKException("cannot allocate " + size + " bytes for a buffer");
+        }
+        return handle(p);
     }
 
     private MemorySegment map(long memory, long size) {
@@ -928,34 +956,57 @@ final class VKDevice {
      * recording the next one once the frame that used its resources executed.
      */
     private void submit(long signal) {
-        Frame frame = frames[frameIndex];
+        if (recording) {
+            submitRecorded(frames[frameIndex], signal);
+        } else if (signal != 0L) {
+            signalEmpty(signal);
+        }
+        beginNextFrame();
+    }
+
+    /** Ends and submits the command buffer of a frame, which signals its fence. */
+    private void submitRecorded(Frame frame, long signal) {
+        endRendering();
+        check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+        recording = false;
         long mark = scratch.mark();
         try {
-            if (recording) {
-                endRendering();
-                check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-                recording = false;
-                MemorySegment cmds = scratch.allocateFrom(JAVA_LONG, cmd);
-                MemorySegment info = VkSubmitInfo.allocate(scratch);
-                VkSubmitInfo.commandBufferCount(info, 1);
-                VkSubmitInfo.pCommandBuffers(info, cmds);
-                if (signal != 0L) {
-                    VkSubmitInfo.signalSemaphoreCount(info, 1);
-                    VkSubmitInfo.pSignalSemaphores(info, scratch.allocateFrom(JAVA_LONG, signal));
-                }
-                check(vkQueueSubmit(queue, 1, info, frame.fence), "vkQueueSubmit");
-                frame.pending = true;
-                statFlushes++;
-            } else if (signal != 0L) {
-                // Nothing recorded: signal on an empty submission
-                MemorySegment info = VkSubmitInfo.allocate(scratch);
-                VkSubmitInfo.signalSemaphoreCount(info, 1);
-                VkSubmitInfo.pSignalSemaphores(info, scratch.allocateFrom(JAVA_LONG, signal));
-                check(vkQueueSubmit(queue, 1, info, 0L), "vkQueueSubmit");
-            }
+            MemorySegment info = VkSubmitInfo.allocate(scratch);
+            VkSubmitInfo.commandBufferCount(info, 1);
+            VkSubmitInfo.pCommandBuffers(info, scratch.allocateFrom(JAVA_LONG, cmd));
+            signalOnSubmit(info, signal);
+            check(vkQueueSubmit(queue, 1, info, frame.fence), "vkQueueSubmit");
+            frame.pending = true;
+            statFlushes++;
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /** Nothing was recorded: signals the semaphore on an empty submission. */
+    private void signalEmpty(long signal) {
+        long mark = scratch.mark();
+        try {
+            MemorySegment info = VkSubmitInfo.allocate(scratch);
+            signalOnSubmit(info, signal);
+            check(vkQueueSubmit(queue, 1, info, 0L), "vkQueueSubmit");
+        } finally {
+            scratch.reset(mark);
+        }
+    }
+
+    private void signalOnSubmit(MemorySegment info, long signal) {
+        if (signal != 0L) {
+            VkSubmitInfo.signalSemaphoreCount(info, 1);
+            VkSubmitInfo.pSignalSemaphores(info, scratch.allocateFrom(JAVA_LONG, signal));
+        }
+    }
+
+    /**
+     * Starts recording the next frame once the frame that last used its
+     * command buffer and its half of the ring has executed.
+     */
+    private void beginNextFrame() {
         frameIndex = (frameIndex + 1) % FRAMES;
         Frame next = frames[frameIndex];
         waitFrame(next);
@@ -1032,33 +1083,41 @@ final class VKDevice {
         ensureRecording();
         long mark = scratch.mark();
         try {
-            int srcStage = stageOf(img.layout);
-            int dstStage = stageOf(layout);
             MemorySegment barrier = VkImageMemoryBarrier.allocate(scratch);
-            // Only writes need to be made available; reads only need to complete
-            VkImageMemoryBarrier.srcAccessMask(barrier, writesOf(img.layout));
-            VkImageMemoryBarrier.dstAccessMask(barrier, accessesOf(layout));
-            VkImageMemoryBarrier.oldLayout(barrier, img.layout);
-            VkImageMemoryBarrier.newLayout(barrier, layout);
-            VkImageMemoryBarrier.srcQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_IGNORED);
-            VkImageMemoryBarrier.dstQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_IGNORED);
-            VkImageMemoryBarrier.image(barrier, img.image);
-            subresourceRange(VkImageMemoryBarrier.subresourceRange(barrier), VK_IMAGE_ASPECT_COLOR_BIT);
-            if (img.foreign) {
-                // Acquire an exported image back from the compositor
-                VkImageMemoryBarrier.srcQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_FOREIGN_EXT);
-                VkImageMemoryBarrier.dstQueueFamilyIndex(barrier, queueFamily);
-                VkImageMemoryBarrier.srcAccessMask(barrier, 0);
-                srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                img.foreign = false;
-            }
-            vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, MemorySegment.NULL, 0, MemorySegment.NULL,
+            int srcStage = layoutBarrier(barrier, img, layout);
+            vkCmdPipelineBarrier(cmd, srcStage, stageOf(layout), 0, 0, MemorySegment.NULL, 0, MemorySegment.NULL,
                     1, barrier);
             img.layout = layout;
             statTransitions++;
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /**
+     * Fills the barrier of a layout transition; an exported image is also
+     * acquired back from the compositor.
+     *
+     * @return the source stage of the barrier
+     */
+    private int layoutBarrier(MemorySegment barrier, VKImage img, int layout) {
+        // Only writes need to be made available; reads only need to complete
+        VkImageMemoryBarrier.srcAccessMask(barrier, writesOf(img.layout));
+        VkImageMemoryBarrier.dstAccessMask(barrier, accessesOf(layout));
+        VkImageMemoryBarrier.oldLayout(barrier, img.layout);
+        VkImageMemoryBarrier.newLayout(barrier, layout);
+        VkImageMemoryBarrier.srcQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_IGNORED);
+        VkImageMemoryBarrier.dstQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_IGNORED);
+        VkImageMemoryBarrier.image(barrier, img.image);
+        subresourceRange(VkImageMemoryBarrier.subresourceRange(barrier), VK_IMAGE_ASPECT_COLOR_BIT);
+        if (!img.foreign) {
+            return stageOf(img.layout);
+        }
+        VkImageMemoryBarrier.srcQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_FOREIGN_EXT);
+        VkImageMemoryBarrier.dstQueueFamilyIndex(barrier, queueFamily);
+        VkImageMemoryBarrier.srcAccessMask(barrier, 0);
+        img.foreign = false;
+        return VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     }
 
     private int depthAspect() {
@@ -1630,22 +1689,8 @@ final class VKDevice {
         }
         transition(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         transition(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        int w = Math.min(Math.min(width, src.width), dst.width);
-        int h = Math.min(Math.min(height, src.height), dst.height);
-        long mark = scratch.mark();
-        try {
-            MemorySegment region = VkImageCopy.allocate(scratch);
-            subresourceLayers(VkImageCopy.srcSubresource(region));
-            subresourceLayers(VkImageCopy.dstSubresource(region));
-            MemorySegment extent = VkImageCopy.extent(region);
-            VkExtent3D.width(extent, w);
-            VkExtent3D.height(extent, h);
-            VkExtent3D.depth(extent, 1);
-            vkCmdCopyImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, region);
-        } finally {
-            scratch.reset(mark);
-        }
+        copyImage(src, dst, Math.min(Math.min(width, src.width), dst.width),
+                Math.min(Math.min(height, src.height), dst.height));
         transition(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         releaseToForeign(dst);
         if (!presentWithSyncFile(dst)) {
@@ -1653,17 +1698,75 @@ final class VKDevice {
             flush();
         }
         if (stats) {
-            System.err.printf("Prism VK frame: draws %d render passes %d transitions %d uploads %d flushes %d%n",
-                    statDraws, statRenderPasses, statTransitions, statUploads, statFlushes);
-            statDraws = statRenderPasses = statTransitions = statUploads = statFlushes = 0;
+            reportStats();
         }
     }
 
+    private void copyImage(VKImage src, VKImage dst, int width, int height) {
+        long mark = scratch.mark();
+        try {
+            MemorySegment region = VkImageCopy.allocate(scratch);
+            subresourceLayers(VkImageCopy.srcSubresource(region));
+            subresourceLayers(VkImageCopy.dstSubresource(region));
+            extent3D(VkImageCopy.extent(region), width, height);
+            vkCmdCopyImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, region);
+        } finally {
+            scratch.reset(mark);
+        }
+    }
+
+    private static void extent3D(MemorySegment extent, int width, int height) {
+        VkExtent3D.width(extent, width);
+        VkExtent3D.height(extent, height);
+        VkExtent3D.depth(extent, 1);
+    }
+
+    private void reportStats() {
+        System.err.printf("Prism VK frame: draws %d render passes %d transitions %d uploads %d flushes %d%n",
+                statDraws, statRenderPasses, statTransitions, statUploads, statFlushes);
+        statDraws = statRenderPasses = statTransitions = statUploads = statFlushes = 0;
+    }
+
+    /**
+     * Submits the frame, signaling the present semaphore, and attaches the
+     * semaphore, exported as a sync file, to the dma-buf of the frame, which
+     * the compositor waits for.
+     *
+     * @return whether the compositor can wait for the frame; when it cannot,
+     *     sync files are not used any more
+     */
     private boolean presentWithSyncFile(VKImage exported) {
         if (!syncFileSupported || exported.fd < 0) {
             return false;
         }
         submit(presentSemaphore);
+        int syncFd = exportSyncFile();
+        if (syncFd == SYNC_FILE_FAILED) {
+            System.err.println("Prism VK error: cannot export the frame sync file");
+            syncFileSupported = false;
+            return false;
+        }
+        if (syncFd == SYNC_FILE_SIGNALED) {
+            return true;
+        }
+        boolean attached = attachSyncFile(exported.fd, syncFd);
+        closeFd(syncFd);
+        if (!attached) {
+            log("cannot attach the sync file to the dma-buf, waiting for the GPU");
+            syncFileSupported = false;
+        }
+        return attached;
+    }
+
+    private static final int SYNC_FILE_SIGNALED = -1;
+    private static final int SYNC_FILE_FAILED = -2;
+
+    /**
+     * The present semaphore as a sync file, or SYNC_FILE_SIGNALED when it is
+     * signaled already, or SYNC_FILE_FAILED.
+     */
+    private int exportSyncFile() {
         long mark = scratch.mark();
         try {
             MemorySegment info = VkSemaphoreGetFdInfoKHR.allocate(scratch);
@@ -1672,28 +1775,24 @@ final class VKDevice {
             MemorySegment pFd = scratch.allocate(JAVA_INT);
             pFd.set(JAVA_INT, 0, -1);
             if (vkGetSemaphoreFdKHR(device, info, pFd) != VK_SUCCESS) {
-                System.err.println("Prism VK error: cannot export the frame sync file");
-                syncFileSupported = false;
-                return false;
+                return SYNC_FILE_FAILED;
             }
-            int syncFd = pFd.get(JAVA_INT, 0);
-            if (syncFd < 0) {
-                // Already signaled
-                return true;
-            }
+            int fd = pFd.get(JAVA_INT, 0);
+            return fd < 0 ? SYNC_FILE_SIGNALED : fd;
+        } finally {
+            scratch.reset(mark);
+        }
+    }
+
+    /** Attaches a sync file to a dma-buf as the fence of a write (DMA_BUF_IOCTL_IMPORT_SYNC_FILE). */
+    private boolean attachSyncFile(int dmabufFd, int syncFd) {
+        long mark = scratch.mark();
+        try {
             MemorySegment request = scratch.allocate(8, 4);
             request.set(JAVA_INT, 0, DMA_BUF_SYNC_WRITE);
             request.set(JAVA_INT, 4, syncFd);
-            int result = (int) IOCTL.invokeExact(exported.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, request);
-            closeFd(syncFd);
-            if (result != 0) {
-                log("cannot attach the sync file to the dma-buf, waiting for the GPU");
-                syncFileSupported = false;
-                return false;
-            }
-            return true;
+            return (int) IOCTL.invokeExact(dmabufFd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, request) == 0;
         } catch (Throwable t) {
-            syncFileSupported = false;
             return false;
         } finally {
             scratch.reset(mark);
@@ -1722,69 +1821,83 @@ final class VKDevice {
         VKImage img = new VKImage(this, texFormat, width, height, samples, renderTarget, exportable);
         long mark = scratch.mark();
         try {
-            int usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-            if (!exportable && samples == 1) {
-                usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-            }
-            if (renderTarget) {
-                usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-            }
-            MemorySegment info = VkImageCreateInfo.allocate(scratch);
-            if (exportable) {
-                MemorySegment external = VkExternalMemoryImageCreateInfo.allocate(scratch);
-                VkExternalMemoryImageCreateInfo.handleTypes(external, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
-                VkImageCreateInfo.pNext(info, external);
-            }
-            VkImageCreateInfo.imageType(info, VK_IMAGE_TYPE_2D);
-            VkImageCreateInfo.format(info, img.format);
-            MemorySegment extent = VkImageCreateInfo.extent(info);
-            VkExtent3D.width(extent, width);
-            VkExtent3D.height(extent, height);
-            VkExtent3D.depth(extent, 1);
-            VkImageCreateInfo.mipLevels(info, 1);
-            VkImageCreateInfo.arrayLayers(info, 1);
-            VkImageCreateInfo.samples(info, samples);
-            VkImageCreateInfo.tiling(info, exportable ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL);
-            VkImageCreateInfo.usage(info, usage);
-            VkImageCreateInfo.sharingMode(info, VK_SHARING_MODE_EXCLUSIVE);
-            VkImageCreateInfo.initialLayout(info, VK_IMAGE_LAYOUT_UNDEFINED);
-            MemorySegment p = scratch.allocate(JAVA_LONG);
-            if (vkCreateImage(device, info, MemorySegment.NULL, p) != VK_SUCCESS) {
+            img.image = createImageHandle(img);
+            if (img.image == 0L) {
                 System.err.println("Prism VK error: cannot create a " + width + "x" + height + " image");
                 return null;
             }
-            img.image = handle(p);
             img.memory = allocateImageMemory(img.image, exportable);
             if (img.memory == 0L) {
                 vkDestroyImage(device, img.image, MemorySegment.NULL);
                 return null;
             }
-
             if (exportable) {
-                MemorySegment sub = VkImageSubresource.allocate(scratch);
-                VkImageSubresource.aspectMask(sub, VK_IMAGE_ASPECT_COLOR_BIT);
-                MemorySegment layout = VkSubresourceLayout.allocate(scratch);
-                vkGetImageSubresourceLayout(device, img.image, sub, layout);
-                img.rowPitch = VkSubresourceLayout.rowPitch(layout);
-                img.offset = VkSubresourceLayout.offset(layout);
-                MemorySegment fdInfo = VkMemoryGetFdInfoKHR.allocate(scratch);
-                VkMemoryGetFdInfoKHR.memory(fdInfo, img.memory);
-                VkMemoryGetFdInfoKHR.handleType(fdInfo, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
-                MemorySegment pFd = scratch.allocate(JAVA_INT);
-                if (vkGetMemoryFdKHR(device, fdInfo, pFd) != VK_SUCCESS) {
-                    System.err.println("Prism VK error: cannot export the image memory");
-                    destroyImageNow(img);
-                    return null;
-                }
-                img.fd = pFd.get(JAVA_INT, 0);
-            } else {
-                img.view = createView(img.image, img.format, VK_IMAGE_ASPECT_COLOR_BIT,
-                        renderTarget ? VK_COMPONENT_SWIZZLE_IDENTITY : -1, texFormat);
+                return export(img) ? img : null;
             }
+            img.view = createView(img.image, img.format, VK_IMAGE_ASPECT_COLOR_BIT,
+                    renderTarget ? VK_COMPONENT_SWIZZLE_IDENTITY : -1, texFormat);
             return img;
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /** The VkImage of an image, or 0 when it cannot be created. */
+    private long createImageHandle(VKImage img) {
+        MemorySegment info = VkImageCreateInfo.allocate(scratch);
+        if (img.exportable) {
+            MemorySegment external = VkExternalMemoryImageCreateInfo.allocate(scratch);
+            VkExternalMemoryImageCreateInfo.handleTypes(external, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+            VkImageCreateInfo.pNext(info, external);
+        }
+        VkImageCreateInfo.imageType(info, VK_IMAGE_TYPE_2D);
+        VkImageCreateInfo.format(info, img.format);
+        extent3D(VkImageCreateInfo.extent(info), img.width, img.height);
+        VkImageCreateInfo.mipLevels(info, 1);
+        VkImageCreateInfo.arrayLayers(info, 1);
+        VkImageCreateInfo.samples(info, img.samples);
+        VkImageCreateInfo.tiling(info, img.exportable ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL);
+        VkImageCreateInfo.usage(info, imageUsage(img));
+        VkImageCreateInfo.sharingMode(info, VK_SHARING_MODE_EXCLUSIVE);
+        VkImageCreateInfo.initialLayout(info, VK_IMAGE_LAYOUT_UNDEFINED);
+        MemorySegment p = scratch.allocate(JAVA_LONG);
+        return vkCreateImage(device, info, MemorySegment.NULL, p) == VK_SUCCESS ? handle(p) : 0L;
+    }
+
+    /** Copies from and to every image; sampled unless exported or multisampled; drawn into if a target. */
+    private static int imageUsage(VKImage img) {
+        int usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (!img.exportable && img.samples == 1) {
+            usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        }
+        if (img.renderTarget) {
+            usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        }
+        return usage;
+    }
+
+    /**
+     * Exports the memory of a linear image as a dma-buf, with the layout of
+     * its rows; destroys the image when it cannot.
+     */
+    private boolean export(VKImage img) {
+        MemorySegment sub = VkImageSubresource.allocate(scratch);
+        VkImageSubresource.aspectMask(sub, VK_IMAGE_ASPECT_COLOR_BIT);
+        MemorySegment layout = VkSubresourceLayout.allocate(scratch);
+        vkGetImageSubresourceLayout(device, img.image, sub, layout);
+        img.rowPitch = VkSubresourceLayout.rowPitch(layout);
+        img.offset = VkSubresourceLayout.offset(layout);
+        MemorySegment fdInfo = VkMemoryGetFdInfoKHR.allocate(scratch);
+        VkMemoryGetFdInfoKHR.memory(fdInfo, img.memory);
+        VkMemoryGetFdInfoKHR.handleType(fdInfo, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+        MemorySegment pFd = scratch.allocate(JAVA_INT);
+        if (vkGetMemoryFdKHR(device, fdInfo, pFd) != VK_SUCCESS) {
+            System.err.println("Prism VK error: cannot export the image memory");
+            destroyImageNow(img);
+            return false;
+        }
+        img.fd = pFd.get(JAVA_INT, 0);
+        return true;
     }
 
     private long allocateImageMemory(long image, boolean exportable) {
@@ -1849,21 +1962,8 @@ final class VKDevice {
     private void createDepth(VKImage img) {
         long mark = scratch.mark();
         try {
-            MemorySegment info = VkImageCreateInfo.allocate(scratch);
-            VkImageCreateInfo.imageType(info, VK_IMAGE_TYPE_2D);
-            VkImageCreateInfo.format(info, depthFormat);
-            MemorySegment extent = VkImageCreateInfo.extent(info);
-            VkExtent3D.width(extent, img.width);
-            VkExtent3D.height(extent, img.height);
-            VkExtent3D.depth(extent, 1);
-            VkImageCreateInfo.mipLevels(info, 1);
-            VkImageCreateInfo.arrayLayers(info, 1);
-            VkImageCreateInfo.samples(info, img.samples);
-            VkImageCreateInfo.tiling(info, VK_IMAGE_TILING_OPTIMAL);
-            VkImageCreateInfo.usage(info, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
-            VkImageCreateInfo.sharingMode(info, VK_SHARING_MODE_EXCLUSIVE);
             MemorySegment p = scratch.allocate(JAVA_LONG);
-            if (vkCreateImage(device, info, MemorySegment.NULL, p) != VK_SUCCESS) {
+            if (vkCreateImage(device, depthImageInfo(img), MemorySegment.NULL, p) != VK_SUCCESS) {
                 System.err.println("Prism VK error: cannot create a depth buffer");
                 return;
             }
@@ -1880,6 +1980,21 @@ final class VKDevice {
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /** A depth buffer of the size and the samples of a target. */
+    private MemorySegment depthImageInfo(VKImage img) {
+        MemorySegment info = VkImageCreateInfo.allocate(scratch);
+        VkImageCreateInfo.imageType(info, VK_IMAGE_TYPE_2D);
+        VkImageCreateInfo.format(info, depthFormat);
+        extent3D(VkImageCreateInfo.extent(info), img.width, img.height);
+        VkImageCreateInfo.mipLevels(info, 1);
+        VkImageCreateInfo.arrayLayers(info, 1);
+        VkImageCreateInfo.samples(info, img.samples);
+        VkImageCreateInfo.tiling(info, VK_IMAGE_TILING_OPTIMAL);
+        VkImageCreateInfo.usage(info, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+        VkImageCreateInfo.sharingMode(info, VK_SHARING_MODE_EXCLUSIVE);
+        return info;
     }
 
     /** Destroys an image once the frames that may use it have executed. */
@@ -1937,48 +2052,14 @@ final class VKDevice {
             return;
         }
         int rowBytes = width * img.bytesPerPixel;
-        long size = (long) rowBytes * height;
-        long buffer = ringBuffer;
-        MemorySegment mapped;
-        boolean fitsRing = size <= RING_SIZE / FRAMES;
-        long offset = fitsRing ? ringAlloc(size, 16) : -1;
-        if (offset < 0 && fitsRing) {
-            submit(0L);
-            offset = ringAlloc(size, 16);
-        }
-        if (offset < 0) {
-            // Larger than the ring buffer
-            Frame frame = frames[frameIndex];
-            offset = stagingAlloc(frame, size);
-            buffer = frame.stagingBuffer;
-            mapped = frame.stagingMapped.asSlice(offset, size);
-        } else {
-            mapped = ringMapped.asSlice(offset, size);
-        }
-        MemorySegment dst = mapped;
+        Staging staging = stage((long) rowBytes * height);
         long srcBase = (long) srcy * stride + (long) srcx * img.bytesPerPixel;
-        if (stride == rowBytes) {
-            MemorySegment.copy(src, srcBase, dst, 0, size);
-        } else {
-            for (int y = 0; y < height; y++) {
-                MemorySegment.copy(src, srcBase + (long) y * stride, dst, (long) y * rowBytes, rowBytes);
-            }
-        }
-
+        copyRows(src, srcBase, stride, staging.mapped(), rowBytes, height);
         transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         long mark = scratch.mark();
         try {
-            MemorySegment region = VkBufferImageCopy.allocate(scratch);
-            VkBufferImageCopy.bufferOffset(region, offset);
-            VkBufferImageCopy.bufferRowLength(region, width);
-            VkBufferImageCopy.bufferImageHeight(region, height);
-            subresourceLayers(VkBufferImageCopy.imageSubresource(region));
-            offset3D(VkBufferImageCopy.imageOffset(region), dstx, dsty, 0);
-            MemorySegment extent = VkBufferImageCopy.imageExtent(region);
-            VkExtent3D.width(extent, width);
-            VkExtent3D.height(extent, height);
-            VkExtent3D.depth(extent, 1);
-            vkCmdCopyBufferToImage(cmd, buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, region);
+            vkCmdCopyBufferToImage(cmd, staging.buffer(), img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                    bufferImageRegion(staging.offset(), dstx, dsty, width, height));
             statUploads++;
             // The next draw that samples the image makes it readable
         } finally {
@@ -1986,17 +2067,56 @@ final class VKDevice {
         }
     }
 
+    /** Host memory for an upload, in a buffer at an offset. */
+    private record Staging(long buffer, long offset, MemorySegment mapped) {}
+
+    /**
+     * Host memory for an upload: in the ring, after submitting the frame when
+     * its half is full, or in the staging buffer of the frame when larger.
+     */
+    private Staging stage(long size) {
+        boolean fitsRing = size <= RING_SIZE / FRAMES;
+        long offset = fitsRing ? ringAlloc(size, 16) : -1;
+        if (offset < 0 && fitsRing) {
+            submit(0L);
+            offset = ringAlloc(size, 16);
+        }
+        if (offset >= 0) {
+            return new Staging(ringBuffer, offset, ringMapped.asSlice(offset, size));
+        }
+        Frame frame = frames[frameIndex];
+        offset = stagingAlloc(frame, size);
+        return new Staging(frame.stagingBuffer, offset, frame.stagingMapped.asSlice(offset, size));
+    }
+
+    /** Copies rows that are stride bytes apart into packed rows. */
+    private static void copyRows(MemorySegment src, long srcBase, int stride, MemorySegment dst,
+                                 int rowBytes, int height) {
+        if (stride == rowBytes) {
+            MemorySegment.copy(src, srcBase, dst, 0, (long) rowBytes * height);
+            return;
+        }
+        for (int y = 0; y < height; y++) {
+            MemorySegment.copy(src, srcBase + (long) y * stride, dst, (long) y * rowBytes, rowBytes);
+        }
+    }
+
+    /** A copy between packed rows of a buffer and a rectangle of an image. */
+    private MemorySegment bufferImageRegion(long bufferOffset, int x, int y, int width, int height) {
+        MemorySegment region = VkBufferImageCopy.allocate(scratch);
+        VkBufferImageCopy.bufferOffset(region, bufferOffset);
+        VkBufferImageCopy.bufferRowLength(region, width);
+        VkBufferImageCopy.bufferImageHeight(region, height);
+        subresourceLayers(VkBufferImageCopy.imageSubresource(region));
+        offset3D(VkBufferImageCopy.imageOffset(region), x, y, 0);
+        extent3D(VkBufferImageCopy.imageExtent(region), width, height);
+        return region;
+    }
+
     /** Reads a rectangle of pixels from an image, waiting for the rendering. */
     boolean readImage(VKImage img, MemorySegment dst, int x, int y, int width, int height) {
         if (img.samples > 1) {
-            VKImage resolved = createImage(VKImage.FORMAT_BGRA8, img.width, img.height, 1, true, false);
-            if (resolved == null) {
-                return false;
-            }
-            resolve(img, resolved, 0, 0, img.width, img.height);
-            boolean ok = readImage(resolved, dst, x, y, width, height);
-            resolved.dispose();
-            return ok;
+            return readMultisampled(img, dst, x, y, width, height);
         }
         long size = (long) width * height * img.bytesPerPixel;
         long[] host = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -2006,21 +2126,7 @@ final class VKDevice {
             int previous = img.layout == VK_IMAGE_LAYOUT_UNDEFINED
                     ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : img.layout;
             transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            long mark = scratch.mark();
-            try {
-                MemorySegment region = VkBufferImageCopy.allocate(scratch);
-                VkBufferImageCopy.bufferRowLength(region, width);
-                VkBufferImageCopy.bufferImageHeight(region, height);
-                subresourceLayers(VkBufferImageCopy.imageSubresource(region));
-                offset3D(VkBufferImageCopy.imageOffset(region), x, y, 0);
-                MemorySegment extent = VkBufferImageCopy.imageExtent(region);
-                VkExtent3D.width(extent, width);
-                VkExtent3D.height(extent, height);
-                VkExtent3D.depth(extent, 1);
-                vkCmdCopyImageToBuffer(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, host[0], 1, region);
-            } finally {
-                scratch.reset(mark);
-            }
+            copyToBuffer(img, host[0], x, y, width, height);
             transition(img, previous);
             flush();
             MemorySegment.copy(mapped, 0, dst, 0, size);
@@ -2029,6 +2135,28 @@ final class VKDevice {
             return false;
         } finally {
             destroyBuffer(host[0], host[1]);
+        }
+    }
+
+    /** Reads a multisampled image through a resolved copy. */
+    private boolean readMultisampled(VKImage img, MemorySegment dst, int x, int y, int width, int height) {
+        VKImage resolved = createImage(VKImage.FORMAT_BGRA8, img.width, img.height, 1, true, false);
+        if (resolved == null) {
+            return false;
+        }
+        resolve(img, resolved, 0, 0, img.width, img.height);
+        boolean ok = readImage(resolved, dst, x, y, width, height);
+        resolved.dispose();
+        return ok;
+    }
+
+    private void copyToBuffer(VKImage img, long buffer, int x, int y, int width, int height) {
+        long mark = scratch.mark();
+        try {
+            vkCmdCopyImageToBuffer(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
+                    bufferImageRegion(0, x, y, width, height));
+        } finally {
+            scratch.reset(mark);
         }
     }
 
@@ -2283,27 +2411,16 @@ final class VKDevice {
             return null;
         }
         boolean shortIndices = indices instanceof short[];
-        long vertexBytes = vertexCount * 4L;
-        long indexBytes = indexCount * (shortIndices ? 2L : 4L);
         MeshBuffers mesh = new MeshBuffers();
         try {
-            int flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            long[] vb = createBuffer(vertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, flags);
+            long[] vb = createFilledBuffer(vertexCount * 4L, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                    m -> MemorySegment.copy(vertices, 0, m, JAVA_FLOAT, 0, vertexCount));
             mesh.vertexBuffer = vb[0];
             mesh.vertexMemory = vb[1];
-            MemorySegment vm = map(vb[1], vertexBytes);
-            MemorySegment.copy(vertices, 0, vm, JAVA_FLOAT, 0, vertexCount);
-            vkUnmapMemory(device, vb[1]);
-            long[] ib = createBuffer(indexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, flags);
+            long[] ib = createFilledBuffer(indexCount * (shortIndices ? 2L : 4L), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                    m -> copyIndices(indices, m, indexCount));
             mesh.indexBuffer = ib[0];
             mesh.indexMemory = ib[1];
-            MemorySegment im = map(ib[1], indexBytes);
-            if (shortIndices) {
-                MemorySegment.copy((short[]) indices, 0, im, ValueLayout.JAVA_SHORT, 0, indexCount);
-            } else {
-                MemorySegment.copy((int[]) indices, 0, im, JAVA_INT, 0, indexCount);
-            }
-            vkUnmapMemory(device, ib[1]);
             mesh.indexType = shortIndices ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
             mesh.indexCount = indexCount;
             return mesh;
@@ -2311,6 +2428,23 @@ final class VKDevice {
             destroyMeshBuffers(mesh);
             return null;
         }
+    }
+
+    private static void copyIndices(Object indices, MemorySegment dst, int count) {
+        switch (indices) {
+            case short[] s -> MemorySegment.copy(s, 0, dst, ValueLayout.JAVA_SHORT, 0, count);
+            case int[] i -> MemorySegment.copy(i, 0, dst, JAVA_INT, 0, count);
+            default -> throw new IllegalArgumentException("Indices must be short[] or int[]");
+        }
+    }
+
+    /** A host-visible buffer, filled once by a writer, returned as {buffer, memory}. */
+    private long[] createFilledBuffer(long size, int usage, java.util.function.Consumer<MemorySegment> writer) {
+        long[] buffer = createBuffer(size, usage,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        writer.accept(map(buffer[1], size));
+        vkUnmapMemory(device, buffer[1]);
+        return buffer;
     }
 
     void destroyMeshBuffers(MeshBuffers mesh) {
@@ -2377,48 +2511,70 @@ final class VKDevice {
         if (mesh == null || target == null || phongVertexModule == 0L) {
             return;
         }
+        VKImage[] images = meshImages(maps);
+        long[] imageSamplers = meshSamplers(linear);
+        long uniformOffset = uploadUniforms(uniforms);
+        if (!beginRendering()) {
+            return;
+        }
+        long pipeline = phongPipeline(variant, wireframe);
+        if (pipeline != 0L) {
+            recordMesh(mesh, pipeline, cull, uniformOffset, uniforms.length * 4L, images, imageSamplers);
+        }
+    }
+
+    /** The maps of a material, readable, with the white texture for the missing ones. */
+    private VKImage[] meshImages(VKImage[] maps) {
         VKImage[] images = new VKImage[MAX_TEXTURE_UNITS];
-        long[] imageSamplers = new long[MAX_TEXTURE_UNITS];
         for (int i = 0; i < MAX_TEXTURE_UNITS; i++) {
             VKImage img = maps[i] != null && !maps[i].disposed ? maps[i] : dummyTexture();
             transition(img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             images[i] = img;
+        }
+        return images;
+    }
+
+    private long[] meshSamplers(boolean[] linear) {
+        long[] imageSamplers = new long[MAX_TEXTURE_UNITS];
+        for (int i = 0; i < MAX_TEXTURE_UNITS; i++) {
             imageSamplers[i] = samplers[linear[i] ? 1 : 0][WRAP_REPEAT];
         }
-        long uniformBytes = uniforms.length * 4L;
-        long uniformOffset = ringAlloc(uniformBytes, minUniformAlignment);
-        if (uniformOffset < 0) {
-            submit(0L);
-            uniformOffset = ringAlloc(uniformBytes, minUniformAlignment);
-        }
-        MemorySegment.copy(uniforms, 0, ringMapped, JAVA_FLOAT, uniformOffset, uniforms.length);
+        return imageSamplers;
+    }
 
-        if (!beginRendering()) {
-            return;
+    /** Copies a uniform block into the ring, after submitting the frame when its half is full. */
+    private long uploadUniforms(float[] uniforms) {
+        long bytes = uniforms.length * 4L;
+        long offset = ringAlloc(bytes, minUniformAlignment);
+        if (offset < 0) {
+            submit(0L);
+            offset = ringAlloc(bytes, minUniformAlignment);
         }
+        MemorySegment.copy(uniforms, 0, ringMapped, JAVA_FLOAT, offset, uniforms.length);
+        return offset;
+    }
+
+    /** The Phong pipeline of a material variant and of the target, created on first use. */
+    private long phongPipeline(int[] variant, boolean wireframe) {
         int key = 0;
         for (int v : variant) {
             key = key * 4 + v;
         }
         key = ((key * 2 + (wireframe ? 1 : 0)) * 2 + (target.hasDepth() ? 1 : 0)) * 4 + target.sampleIndex();
-        Long pipeline = phongPipelines.get(key);
-        if (pipeline == null) {
-            pipeline = createPipeline(phongVertexModule, phongFragmentModule, true, variant, COMP_SRCOVER,
-                    target.hasDepth(), target.sampleIndex(), wireframe);
-            phongPipelines.put(key, pipeline);
-        }
-        if (pipeline == 0L) {
-            return;
-        }
+        return phongPipelines.computeIfAbsent(key, k -> createPipeline(phongVertexModule, phongFragmentModule,
+                true, variant, COMP_SRCOVER, target.hasDepth(), target.sampleIndex(), wireframe));
+    }
+
+    private void recordMesh(MeshBuffers mesh, long pipeline, int cull, long uniformOffset, long uniformBytes,
+                            VKImage[] images, long[] imageSamplers) {
         long mark = scratch.mark();
         try {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             pushDescriptors(uniformOffset, uniformBytes, images, imageSamplers);
             // Meshes are not clipped
             setDrawState(false, cull);
-            MemorySegment buffers = scratch.allocateFrom(JAVA_LONG, mesh.vertexBuffer);
-            MemorySegment offsets = scratch.allocateFrom(JAVA_LONG, 0L);
-            vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
+            vkCmdBindVertexBuffers(cmd, 0, 1, scratch.allocateFrom(JAVA_LONG, mesh.vertexBuffer),
+                    scratch.allocateFrom(JAVA_LONG, 0L));
             vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, mesh.indexType);
             vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
             statDraws++;

@@ -38,6 +38,7 @@ import com.sun.prism.impl.PrismSettings;
 import com.sun.prism.impl.ps.BaseShaderContext;
 import com.sun.prism.ps.Shader;
 
+import java.util.Arrays;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -308,85 +309,121 @@ class GLContext extends BaseShaderContext {
             return;
         }
         float[] u = phongUniforms;
+        putTransforms(u, g);
+        put4(u, 32, (float) cameraPos.x, (float) cameraPos.y, (float) cameraPos.z, 0f);
+        putColors(u, meshView, material);
+        int numLights = putLights(u, meshView.getLights());
+        MeshMaps maps = MeshMaps.of(material.getTextures());
+        int[] variant = {
+            maps.has(GLPhongMaterial.DIFFUSE) ? 2 : 1,
+            material.getSpecularMode(maps.has(GLPhongMaterial.SPECULAR)),
+            maps.has(GLPhongMaterial.SELF_ILLUM) ? 1 : 0,
+            maps.has(GLPhongMaterial.BUMP) ? 1 : 0,
+            numLights
+        };
+        device.drawMesh(mesh.getBuffers(), variant, meshView.getCullingMode(), meshView.isWireframe(), u,
+                maps.images(), maps.linear());
+    }
 
-        // Support HiDPI by scaling the projection, as the transform holds the scale of the target
-        float pixelScaleFactorX = g.getPixelScaleFactorX();
-        float pixelScaleFactorY = g.getPixelScaleFactorY();
+    /**
+     * The projection, scaled for HiDPI as the transform holds the scale of
+     * the target, and the world transform without that scale.
+     */
+    private void putTransforms(float[] u, Graphics g) {
+        float scaleX = g.getPixelScaleFactorX();
+        float scaleY = g.getPixelScaleFactorY();
+        boolean scaled = scaleX != 1.0 || scaleY != 1.0;
         scratchTx = scratchTx.set(projViewTx);
-        if (pixelScaleFactorX != 1.0 || pixelScaleFactorY != 1.0) {
-            scratchTx.scale(pixelScaleFactorX, pixelScaleFactorY, 1.0);
+        if (scaled) {
+            scratchTx.scale(scaleX, scaleY, 1.0);
         }
         putMatrix(u, 0, scratchTx);
-
         BaseTransform xform = g.getTransformNoClone();
-        if (pixelScaleFactorX != 1.0 || pixelScaleFactorY != 1.0) {
+        if (scaled) {
             scratchAffine3DTx.setToIdentity();
-            scratchAffine3DTx.scale(1.0 / pixelScaleFactorX, 1.0 / pixelScaleFactorY);
+            scratchAffine3DTx.scale(1.0 / scaleX, 1.0 / scaleY);
             scratchAffine3DTx.concatenate(xform);
-            updateWorldTransform(scratchAffine3DTx);
-        } else {
-            updateWorldTransform(xform);
+            xform = scratchAffine3DTx;
         }
+        updateWorldTransform(xform);
         putMatrix(u, 16, worldTx);
+    }
 
-        put4(u, 32, (float) cameraPos.x, (float) cameraPos.y, (float) cameraPos.z, 0f);
+    /** The ambient light and the diffuse and specular colors of the material. */
+    private static void putColors(float[] u, GLMeshView meshView, GLPhongMaterial material) {
         put4(u, 36, meshView.getAmbientLightRed(), meshView.getAmbientLightGreen(),
                 meshView.getAmbientLightBlue(), 0f);
         var diffuse = material.diffuseColor;
         put4(u, 40, diffuse.getRed(), diffuse.getGreen(), diffuse.getBlue(), diffuse.getAlpha());
         var specular = material.specularColor;
         put4(u, 44, specular.getRed(), specular.getGreen(), specular.getBlue(), specular.getAlpha());
+    }
 
+    private static final int LIGHTS = 3;
+    private static final int LIGHT_FLOATS = 20;
+
+    /**
+     * The three lights, 20 floats each from float 48, zeros for those that
+     * are off.
+     *
+     * @return the number of lights that are on
+     */
+    private static int putLights(float[] u, GLLight[] lights) {
         int numLights = 0;
-        GLLight[] lights = meshView.getLights();
-        for (int i = 0; i < 3; i++) {
-            int base = 48 + i * 20;
+        for (int i = 0; i < LIGHTS; i++) {
+            int base = 48 + i * LIGHT_FLOATS;
             GLLight light = lights[i];
             if (light == null || light.w <= 0) {
-                java.util.Arrays.fill(u, base, base + 20, 0f);
-                continue;
-            }
-            numLights++;
-            put4(u, base, light.x, light.y, light.z, light.w);
-            put4(u, base + 4, light.r, light.g, light.b, 0f);
-            put4(u, base + 8, light.ca, light.la, light.qa, light.isAttenuated);
-            if (light.isPointLight()) {
-                put4(u, base + 12, 0f, 0f, 1f, 0f);
+                Arrays.fill(u, base, base + LIGHT_FLOATS, 0f);
             } else {
-                float length = (float) Math.sqrt(light.dirX * light.dirX + light.dirY * light.dirY
-                        + light.dirZ * light.dirZ);
-                put4(u, base + 12, light.dirX / length, light.dirY / length, light.dirZ / length, 0f);
+                putLight(u, base, light);
+                numLights++;
             }
-            if (light.isPointLight() || light.isDirectionalLight()) {
-                put4(u, base + 16, light.maxRange, -1f, 2f, 0f);
-            } else {
-                // I = pow((cosAngle - cosOuter) / (cosInner - cosOuter), falloff)
-                float cosOuter = (float) Math.cos(Math.toRadians(light.outerAngle));
-                float cosInner = (float) Math.cos(Math.toRadians(light.innerAngle));
-                put4(u, base + 16, light.maxRange, cosOuter, cosInner - cosOuter, light.falloff);
+        }
+        return numLights;
+    }
+
+    /** A light: position, color, attenuation, direction and range or spot cone. */
+    private static void putLight(float[] u, int base, GLLight light) {
+        put4(u, base, light.x, light.y, light.z, light.w);
+        put4(u, base + 4, light.r, light.g, light.b, 0f);
+        put4(u, base + 8, light.ca, light.la, light.qa, light.isAttenuated);
+        if (light.isPointLight()) {
+            put4(u, base + 12, 0f, 0f, 1f, 0f);
+        } else {
+            float length = (float) Math.sqrt(light.dirX * light.dirX + light.dirY * light.dirY
+                    + light.dirZ * light.dirZ);
+            put4(u, base + 12, light.dirX / length, light.dirY / length, light.dirZ / length, 0f);
+        }
+        if (light.isPointLight() || light.isDirectionalLight()) {
+            put4(u, base + 16, light.maxRange, -1f, 2f, 0f);
+        } else {
+            // I = pow((cosAngle - cosOuter) / (cosInner - cosOuter), falloff)
+            float cosOuter = (float) Math.cos(Math.toRadians(light.outerAngle));
+            float cosInner = (float) Math.cos(Math.toRadians(light.innerAngle));
+            put4(u, base + 16, light.maxRange, cosOuter, cosInner - cosOuter, light.falloff);
+        }
+    }
+
+    /** The maps of a material and whether each is filtered linearly. */
+    private record MeshMaps(GLImage[] images, boolean[] linear) {
+        static MeshMaps of(Texture[] maps) {
+            GLImage[] images = new GLImage[GLDevice.MAX_TEXTURE_UNITS];
+            boolean[] linear = new boolean[GLDevice.MAX_TEXTURE_UNITS];
+            for (int i = 0; i < images.length; i++) {
+                if (maps[i] instanceof GLTexture<?> t) {
+                    images[i] = t.getImage();
+                    linear[i] = t.getLinearFiltering();
+                } else {
+                    linear[i] = true;
+                }
             }
+            return new MeshMaps(images, linear);
         }
 
-        Texture[] maps = material.getTextures();
-        GLImage[] images = new GLImage[GLDevice.MAX_TEXTURE_UNITS];
-        boolean[] linear = new boolean[GLDevice.MAX_TEXTURE_UNITS];
-        for (int i = 0; i < images.length; i++) {
-            if (maps[i] instanceof GLTexture<?> t) {
-                images[i] = t.getImage();
-                linear[i] = t.getLinearFiltering();
-            } else {
-                linear[i] = true;
-            }
+        boolean has(int map) {
+            return images[map] != null;
         }
-        int[] variant = {
-            images[GLPhongMaterial.DIFFUSE] != null ? 2 : 1,
-            material.getSpecularMode(images[GLPhongMaterial.SPECULAR] != null),
-            images[GLPhongMaterial.SELF_ILLUM] != null ? 1 : 0,
-            images[GLPhongMaterial.BUMP] != null ? 1 : 0,
-            numLights
-        };
-        device.drawMesh(mesh.getBuffers(), variant, meshView.getCullingMode(), meshView.isWireframe(), u,
-                images, linear);
     }
 
     @Override

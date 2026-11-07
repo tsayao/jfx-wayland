@@ -307,6 +307,24 @@ final class GLDevice {
         if (!eglExtensions.contains("EGL_KHR_surfaceless_context")) {
             throw new IllegalStateException("EGL_KHR_surfaceless_context is not supported");
         }
+        createContext();
+        makeCurrent();
+        readCapabilities(eglExtensions);
+        // Upper-left origin and [0, 1] depth, as in Vulkan
+        GL.glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
+        GL.glFrontFace(GL_CCW);
+        GL.glDepthFunc(GL_LEQUAL);
+        passThroughVertex = compile(GL_VERTEX_SHADER, passThroughSource, "PassThrough.vert");
+        if (passThroughVertex == 0) {
+            throw new IllegalStateException("Cannot compile the vertex shader");
+        }
+        createQuadObjects();
+        createSamplers();
+        checkError("init");
+    }
+
+    /** An OpenGL 4.5 core context, without a surface. */
+    private void createContext() {
         MemorySegment attribs = arena.allocateFrom(JAVA_INT,
                 EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 5,
                 EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE);
@@ -315,45 +333,44 @@ final class GLDevice {
             throw new IllegalStateException("No OpenGL 4.5 core context (EGL error 0x"
                     + Integer.toHexString(EGL.eglGetError()) + ")");
         }
-        makeCurrent();
+    }
 
+    /** The limits, the multisampling and whether frames can be exported with sync files. */
+    private void readCapabilities(String eglExtensions) {
         deviceName = glString(GL_RENDERER);
         log("using " + deviceName + ", " + glString(GL_VERSION));
         maxTextureSize = getInteger(GL_MAX_TEXTURE_SIZE);
-        int maxSamples = getInteger(GL_MAX_SAMPLES);
-        msaaSamples = maxSamples >= 4 ? 4 : 1;
-        boolean eglImage = hasGLExtension("GL_OES_EGL_image");
-        exportSupported = eglImage && eglExtensions.contains("EGL_EXT_image_dma_buf_import")
+        msaaSamples = getInteger(GL_MAX_SAMPLES) >= 4 ? 4 : 1;
+        exportSupported = hasGLExtension("GL_OES_EGL_image")
+                && eglExtensions.contains("EGL_EXT_image_dma_buf_import")
                 && eglExtensions.contains("EGL_KHR_image_base");
         fenceSupported = eglExtensions.contains("EGL_ANDROID_native_fence_sync");
         log("export " + (exportSupported ? "yes" : "no") + ", sync file " + (fenceSupported ? "yes" : "no")
                 + ", msaa " + msaaSamples + "x");
+    }
 
-        // Upper-left origin and [0, 1] depth, as in Vulkan
-        GL.glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
-        GL.glFrontFace(GL_CCW);
-        GL.glDepthFunc(GL_LEQUAL);
-
-        passThroughVertex = compile(GL_VERTEX_SHADER, passThroughSource, "PassThrough.vert");
-        if (passThroughVertex == 0) {
-            throw new IllegalStateException("Cannot compile the vertex shader");
-        }
-        createQuadObjects();
+    /** A sampler for each filter and address mode; the border color is transparent black by default. */
+    private void createSamplers() {
         for (int linear = 0; linear < 2; linear++) {
             for (int wrap = 0; wrap < WRAP_COUNT; wrap++) {
-                int s = gen(GL::glGenSamplers);
-                int filter = linear == 1 ? GL_LINEAR : GL_NEAREST;
-                int mode = wrap == WRAP_REPEAT ? GL_REPEAT
-                        : wrap == WRAP_CLAMP_TO_ZERO ? GL_CLAMP_TO_BORDER : GL_CLAMP_TO_EDGE;
-                GL.glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, filter);
-                GL.glSamplerParameteri(s, GL_TEXTURE_MAG_FILTER, filter);
-                GL.glSamplerParameteri(s, GL_TEXTURE_WRAP_S, mode);
-                GL.glSamplerParameteri(s, GL_TEXTURE_WRAP_T, mode);
-                // The border color is transparent black by default
-                samplers[linear][wrap] = s;
+                samplers[linear][wrap] = createSampler(linear == 1, wrap);
             }
         }
-        checkError("init");
+    }
+
+    private int createSampler(boolean linear, int wrap) {
+        int s = gen(GL::glGenSamplers);
+        int filter = linear ? GL_LINEAR : GL_NEAREST;
+        int mode = switch (wrap) {
+            case WRAP_REPEAT -> GL_REPEAT;
+            case WRAP_CLAMP_TO_ZERO -> GL_CLAMP_TO_BORDER;
+            default -> GL_CLAMP_TO_EDGE;
+        };
+        GL.glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, filter);
+        GL.glSamplerParameteri(s, GL_TEXTURE_MAG_FILTER, filter);
+        GL.glSamplerParameteri(s, GL_TEXTURE_WRAP_S, mode);
+        GL.glSamplerParameteri(s, GL_TEXTURE_WRAP_T, mode);
+        return s;
     }
 
     /**
@@ -385,50 +402,70 @@ final class GLDevice {
                     "/dev/dri/renderD131"};
         StringBuilder reasons = new StringBuilder();
         for (String node : nodes) {
-            int fd = LibC.open(arena.allocateFrom(node), O_RDWR | O_CLOEXEC);
-            if (fd < 0) {
-                reasons.append(node).append(": cannot open; ");
-                continue;
+            String reason = tryRenderNode(node);
+            if (reason == null) {
+                return;
             }
-            MemorySegment g = GBM.gbm_create_device(fd);
-            if (g.address() == 0) {
-                LibC.close(fd);
-                reasons.append(node).append(": no GBM device; ");
-                continue;
-            }
-            MemorySegment d = EGL.eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, g, MemorySegment.NULL);
-            MemorySegment major = arena.allocate(JAVA_INT);
-            MemorySegment minor = arena.allocate(JAVA_INT);
-            if (d.address() == 0 || EGL.eglInitialize(d, major, minor) == 0) {
-                GBM.gbm_device_destroy(g);
-                LibC.close(fd);
-                reasons.append(node).append(": no EGL display; ");
-                continue;
-            }
-            // Software rasterizers such as llvmpipe are slower than Prism sw.
-            // Mesa does not mark their configs as slow, but their device is
-            // EGL_MESA_device_software, as when the render node has no 3D
-            // driver and GBM falls back to kms_swrast
-            MemorySegment attribs = arena.allocateFrom(JAVA_INT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
-                    EGL_CONFIG_CAVEAT, EGL_NONE, EGL_NONE);
-            MemorySegment configs = arena.allocate(ADDRESS);
-            MemorySegment count = arena.allocate(JAVA_INT);
-            if (EGL.eglChooseConfig(d, attribs, configs, 1, count) == 0 || count.get(JAVA_INT, 0) < 1
-                    || isSoftware(d)) {
-                EGL.eglTerminate(d);
-                GBM.gbm_device_destroy(g);
-                LibC.close(fd);
-                reasons.append(node).append(": no hardware OpenGL configuration; ");
-                continue;
-            }
-            config = configs.get(ADDRESS, 0);
-            drmFd = fd;
-            gbm = g;
-            display = d;
-            log(node + ", EGL " + major.get(JAVA_INT, 0) + "." + minor.get(JAVA_INT, 0));
-            return;
+            reasons.append(node).append(": ").append(reason).append("; ");
         }
         throw new IllegalStateException("No render node with EGL: " + reasons);
+    }
+
+    /**
+     * Opens GBM and EGL on a render node and keeps them when the node has a
+     * hardware OpenGL configuration.
+     *
+     * @return null when the node is used, or why it is not
+     */
+    private String tryRenderNode(String node) {
+        int fd = LibC.open(arena.allocateFrom(node), O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            return "cannot open";
+        }
+        MemorySegment g = GBM.gbm_create_device(fd);
+        if (g.address() == 0) {
+            LibC.close(fd);
+            return "no GBM device";
+        }
+        MemorySegment d = EGL.eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, g, MemorySegment.NULL);
+        MemorySegment major = arena.allocate(JAVA_INT);
+        MemorySegment minor = arena.allocate(JAVA_INT);
+        if (d.address() == 0 || EGL.eglInitialize(d, major, minor) == 0) {
+            GBM.gbm_device_destroy(g);
+            LibC.close(fd);
+            return "no EGL display";
+        }
+        MemorySegment chosen = hardwareConfig(d);
+        if (chosen == null) {
+            EGL.eglTerminate(d);
+            GBM.gbm_device_destroy(g);
+            LibC.close(fd);
+            return "no hardware OpenGL configuration";
+        }
+        config = chosen;
+        drmFd = fd;
+        gbm = g;
+        display = d;
+        log(node + ", EGL " + major.get(JAVA_INT, 0) + "." + minor.get(JAVA_INT, 0));
+        return null;
+    }
+
+    /**
+     * An OpenGL configuration of a display, or null when it has none or is a
+     * software rasterizer. Software rasterizers such as llvmpipe are slower
+     * than Prism sw; Mesa does not mark their configs as slow, but their
+     * device is EGL_MESA_device_software, as when the render node has no 3D
+     * driver and GBM falls back to kms_swrast.
+     */
+    private MemorySegment hardwareConfig(MemorySegment d) {
+        MemorySegment attribs = arena.allocateFrom(JAVA_INT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+                EGL_CONFIG_CAVEAT, EGL_NONE, EGL_NONE);
+        MemorySegment configs = arena.allocate(ADDRESS);
+        MemorySegment count = arena.allocate(JAVA_INT);
+        if (EGL.eglChooseConfig(d, attribs, configs, 1, count) == 0 || count.get(JAVA_INT, 0) < 1 || isSoftware(d)) {
+            return null;
+        }
+        return configs.get(ADDRESS, 0);
     }
 
     /**
@@ -510,23 +547,38 @@ final class GLDevice {
     private void createQuadObjects() {
         quadVertexArray = gen(GL::glGenVertexArrays);
         GL.glBindVertexArray(quadVertexArray);
-        vertexBuffer = gen(GL::glGenBuffers);
-        GL.glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        GL.glBufferData(GL_ARRAY_BUFFER, (long) MAX_QUADS * 4 * VERTEX_SIZE, MemorySegment.NULL, GL_STREAM_DRAW);
+        vertexBuffer = streamBuffer(GL_ARRAY_BUFFER, (long) MAX_QUADS * 4 * VERTEX_SIZE);
         // x, y, z, u0, v0, u1, v1
-        GL.glEnableVertexAttribArray(0);
-        GL.glVertexAttribPointer(0, 3, GL_FLOAT, (byte) 0, VERTEX_SIZE, 0);
-        GL.glEnableVertexAttribArray(1);
-        GL.glVertexAttribPointer(1, 2, GL_FLOAT, (byte) 0, VERTEX_SIZE, 12);
-        GL.glEnableVertexAttribArray(2);
-        GL.glVertexAttribPointer(2, 2, GL_FLOAT, (byte) 0, VERTEX_SIZE, 20);
-        colorBuffer = gen(GL::glGenBuffers);
-        GL.glBindBuffer(GL_ARRAY_BUFFER, colorBuffer);
-        GL.glBufferData(GL_ARRAY_BUFFER, (long) MAX_QUADS * 4 * 4, MemorySegment.NULL, GL_STREAM_DRAW);
+        floatAttribute(0, 3, VERTEX_SIZE, 0);
+        floatAttribute(1, 2, VERTEX_SIZE, 12);
+        floatAttribute(2, 2, VERTEX_SIZE, 20);
+        colorBuffer = streamBuffer(GL_ARRAY_BUFFER, (long) MAX_QUADS * 4 * 4);
         GL.glEnableVertexAttribArray(3);
         GL.glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, (byte) 1, 4, 0);
+        quadIndexBuffer = gen(GL::glGenBuffers);
+        GL.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, quadIndexBuffer);
+        short[] indices = quadIndices();
+        GL.glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.length * 2L, MemorySegment.ofArray(indices), GL_STATIC_DRAW);
+        GL.glBindVertexArray(0);
+        transformBuffer = streamBuffer(GL_UNIFORM_BUFFER, 64);
+        uniformBuffer = gen(GL::glGenBuffers);
+    }
 
-        // Quad indices: 0 1 2, 1 2 3 for each quad
+    /** A buffer of a size, whose data the draws stream into. */
+    private int streamBuffer(int target, long size) {
+        int buffer = gen(GL::glGenBuffers);
+        GL.glBindBuffer(target, buffer);
+        GL.glBufferData(target, size, MemorySegment.NULL, GL_STREAM_DRAW);
+        return buffer;
+    }
+
+    private static void floatAttribute(int index, int size, int stride, long offset) {
+        GL.glEnableVertexAttribArray(index);
+        GL.glVertexAttribPointer(index, size, GL_FLOAT, (byte) 0, stride, offset);
+    }
+
+    /** The indices of the quads: 0 1 2, 1 2 3 for each quad. */
+    private static short[] quadIndices() {
         short[] indices = new short[MAX_QUADS * 6];
         for (int q = 0; q < MAX_QUADS; q++) {
             short v = (short) (q * 4);
@@ -538,41 +590,14 @@ final class GLDevice {
             indices[base + 4] = (short) (v + 2);
             indices[base + 5] = (short) (v + 3);
         }
-        quadIndexBuffer = gen(GL::glGenBuffers);
-        GL.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, quadIndexBuffer);
-        GL.glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.length * 2L, MemorySegment.ofArray(indices), GL_STATIC_DRAW);
-        GL.glBindVertexArray(0);
-
-        transformBuffer = gen(GL::glGenBuffers);
-        GL.glBindBuffer(GL_UNIFORM_BUFFER, transformBuffer);
-        GL.glBufferData(GL_UNIFORM_BUFFER, 64, MemorySegment.NULL, GL_STREAM_DRAW);
-        uniformBuffer = gen(GL::glGenBuffers);
+        return indices;
     }
 
     void destroy() {
         if (context.address() != 0) {
             try {
                 makeCurrent();
-                for (int[] row : samplers) {
-                    for (int s : row) {
-                        delete(GL::glDeleteSamplers, s);
-                    }
-                }
-                delete(GL::glDeleteVertexArrays, quadVertexArray);
-                delete(GL::glDeleteBuffers, vertexBuffer);
-                delete(GL::glDeleteBuffers, colorBuffer);
-                delete(GL::glDeleteBuffers, quadIndexBuffer);
-                delete(GL::glDeleteBuffers, transformBuffer);
-                delete(GL::glDeleteBuffers, uniformBuffer);
-                for (int program : phongPrograms.values()) {
-                    GL.glDeleteProgram(program);
-                }
-                if (passThroughVertex != 0) {
-                    GL.glDeleteShader(passThroughVertex);
-                }
-                if (phongVertex != 0) {
-                    GL.glDeleteShader(phongVertex);
-                }
+                deleteObjects();
             } catch (RuntimeException | UnsatisfiedLinkError ignored) {
                 // The context is going away
             }
@@ -591,6 +616,27 @@ final class GLDevice {
         if (drmFd >= 0) {
             LibC.close(drmFd);
             drmFd = -1;
+        }
+    }
+
+    /** The samplers, the buffers, the vertex array and the shaders of the device. */
+    private void deleteObjects() {
+        for (int[] row : samplers) {
+            for (int s : row) {
+                delete(GL::glDeleteSamplers, s);
+            }
+        }
+        delete(GL::glDeleteVertexArrays, quadVertexArray);
+        for (int buffer : new int[] {vertexBuffer, colorBuffer, quadIndexBuffer, transformBuffer, uniformBuffer}) {
+            delete(GL::glDeleteBuffers, buffer);
+        }
+        for (int program : phongPrograms.values()) {
+            GL.glDeleteProgram(program);
+        }
+        for (int shader : new int[] {passThroughVertex, phongVertex}) {
+            if (shader != 0) {
+                GL.glDeleteShader(shader);
+            }
         }
     }
 
@@ -863,7 +909,19 @@ final class GLDevice {
         useProgram(program);
         setBlend(compositeMode);
         setDrawState(true, CULL_NONE, false);
+        bindUniforms(s);
+        bindTextures(textures, textureSamplers);
+        int numQuads = Math.min(numVertices / 4, MAX_QUADS);
+        GL.glBindVertexArray(quadVertexArray);
+        streamData(vertexBuffer, (long) numQuads * 4 * VERTEX_SIZE, MemorySegment.ofArray(coords));
+        streamData(colorBuffer, numQuads * 4 * 4L, MemorySegment.ofArray(colors));
+        GL.glDrawElements(GL_TRIANGLES, numQuads * 6, GL_UNSIGNED_SHORT, 0);
+        GL.glBindVertexArray(0);
+        statDraws++;
+    }
 
+    /** The transform, and the uniform block of the shader if it has one. */
+    private void bindUniforms(GLShader s) {
         GL.glBindBuffer(GL_UNIFORM_BUFFER, transformBuffer);
         GL.glBufferSubData(GL_UNIFORM_BUFFER, 0, 64, transform);
         GL.glBindBufferBase(GL_UNIFORM_BUFFER, TRANSFORM_BINDING, transformBuffer);
@@ -873,18 +931,11 @@ final class GLDevice {
             GL.glBufferData(GL_UNIFORM_BUFFER, blockSize, s.getUniforms(), GL_STREAM_DRAW);
             GL.glBindBufferBase(GL_UNIFORM_BUFFER, UNIFORM_BINDING, uniformBuffer);
         }
-        bindTextures(textures, textureSamplers);
+    }
 
-        int numQuads = Math.min(numVertices / 4, MAX_QUADS);
-        int vertices = numQuads * 4;
-        GL.glBindVertexArray(quadVertexArray);
-        GL.glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        GL.glBufferSubData(GL_ARRAY_BUFFER, 0, (long) vertices * VERTEX_SIZE, MemorySegment.ofArray(coords));
-        GL.glBindBuffer(GL_ARRAY_BUFFER, colorBuffer);
-        GL.glBufferSubData(GL_ARRAY_BUFFER, 0, vertices * 4L, MemorySegment.ofArray(colors));
-        GL.glDrawElements(GL_TRIANGLES, numQuads * 6, GL_UNSIGNED_SHORT, 0);
-        GL.glBindVertexArray(0);
-        statDraws++;
+    private static void streamData(int buffer, long size, MemorySegment data) {
+        GL.glBindBuffer(GL_ARRAY_BUFFER, buffer);
+        GL.glBufferSubData(GL_ARRAY_BUFFER, 0, size, data);
     }
 
     void clear(float r, float g, float b, float a, boolean clearDepth) {
@@ -936,25 +987,14 @@ final class GLDevice {
             return;
         }
         makeCurrent();
-        if (src.samples > 1) {
-            boolean exact = sx0 == dx0 && sy0 == dy0 && sx1 == dx1 && sy1 == dy1
-                    && sx1 > sx0 && sy1 > sy0 && dst.samples == 1;
-            if (!exact) {
-                // Resolve into a temporary image, then scale or move it
-                GLImage resolved = createImage(GLImage.FORMAT_BGRA8, src.width, src.height, 1, true, false);
-                if (resolved == null) {
-                    return;
-                }
-                blit(src, resolved, 0, 0, src.width, src.height, 0, 0, src.width, src.height);
-                blit(resolved, dst, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
-                resolved.dispose();
-                return;
-            }
+        boolean exact = sx0 == dx0 && sy0 == dy0 && sx1 == dx1 && sy1 == dy1
+                && sx1 > sx0 && sy1 > sy0 && dst.samples == 1;
+        if (src.samples > 1 && !exact) {
+            blitThroughResolved(src, dst, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
+            return;
         }
-        int read = framebufferOf(src);
-        int draw = framebufferOf(dst);
-        GL.glBindFramebuffer(GL_READ_FRAMEBUFFER, read);
-        GL.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
+        GL.glBindFramebuffer(GL_READ_FRAMEBUFFER, framebufferOf(src));
+        GL.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebufferOf(dst));
         boundFramebuffer = -1;
         // The scissor applies to blits
         GL.glDisable(GL_SCISSOR_TEST);
@@ -962,6 +1002,18 @@ final class GLDevice {
         boolean sameSize = Math.abs(sx1 - sx0) == Math.abs(dx1 - dx0) && Math.abs(sy1 - sy0) == Math.abs(dy1 - dy0);
         GL.glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, GL_COLOR_BUFFER_BIT,
                 sameSize || src.samples > 1 ? GL_NEAREST : GL_LINEAR);
+    }
+
+    /** Resolves a multisampled image into a temporary one, then scales or moves it. */
+    private void blitThroughResolved(GLImage src, GLImage dst, int sx0, int sy0, int sx1, int sy1,
+                                     int dx0, int dy0, int dx1, int dy1) {
+        GLImage resolved = createImage(GLImage.FORMAT_BGRA8, src.width, src.height, 1, true, false);
+        if (resolved == null) {
+            return;
+        }
+        blit(src, resolved, 0, 0, src.width, src.height, 0, 0, src.width, src.height);
+        blit(resolved, dst, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
+        resolved.dispose();
     }
 
     /**
@@ -988,29 +1040,36 @@ final class GLDevice {
         if (!fenceSupported || exported.fd < 0) {
             return false;
         }
-        MemorySegment sync = EGLX.eglCreateSyncKHR(display, EGL_SYNC_NATIVE_FENCE_ANDROID, eglNone);
-        if (sync.address() == 0) {
+        int syncFd = createSyncFile();
+        if (syncFd < 0) {
             fenceSupported = false;
             return false;
+        }
+        syncRequest.set(JAVA_INT, 0, DMA_BUF_SYNC_WRITE);
+        syncRequest.set(JAVA_INT, 4, syncFd);
+        int result = LibC.ioctl(exported.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, syncRequest);
+        LibC.close(syncFd);
+        if (result != 0) {
+            log("cannot attach the sync file to the dma-buf, waiting for the GPU");
+            fenceSupported = false;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * A sync file of the commands submitted so far, through a native fence
+     * of EGL, or -1.
+     */
+    private int createSyncFile() {
+        MemorySegment sync = EGLX.eglCreateSyncKHR(display, EGL_SYNC_NATIVE_FENCE_ANDROID, eglNone);
+        if (sync.address() == 0) {
+            return -1;
         }
         try {
             // The fence is created when the commands are flushed
             GL.glFlush();
-            int syncFd = EGLX.eglDupNativeFenceFDANDROID(display, sync);
-            if (syncFd < 0) {
-                fenceSupported = false;
-                return false;
-            }
-            syncRequest.set(JAVA_INT, 0, DMA_BUF_SYNC_WRITE);
-            syncRequest.set(JAVA_INT, 4, syncFd);
-            int result = LibC.ioctl(exported.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, syncRequest);
-            LibC.close(syncFd);
-            if (result != 0) {
-                log("cannot attach the sync file to the dma-buf, waiting for the GPU");
-                fenceSupported = false;
-                return false;
-            }
-            return true;
+            return EGLX.eglDupNativeFenceFDANDROID(display, sync);
         } finally {
             EGLX.eglDestroySyncKHR(display, sync);
         }
@@ -1026,59 +1085,64 @@ final class GLDevice {
     GLImage createImage(int texFormat, int width, int height, int samples, boolean renderTarget, boolean exportable) {
         makeCurrent();
         GLImage img = new GLImage(this, texFormat, width, height, samples, renderTarget, exportable);
-        if (exportable) {
-            if (!exportSupported) {
-                return null;
-            }
-            if (!createExported(img)) {
-                // Releases what was created: the buffer, its fd and its EGL image
-                destroyImage(img);
-                return null;
-            }
-        } else {
-            img.texture = gen(GL::glGenTextures);
-            if (samples > 1) {
-                GL.glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, img.texture);
-                GL.glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, samples, GL_RGBA8, width, height, (byte) 1);
-                GL.glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 0);
-            } else {
-                GL.glBindTexture(GL_TEXTURE_2D, img.texture);
-                int internal = switch (texFormat) {
-                    case GLImage.FORMAT_ALPHA8, GLImage.FORMAT_GRAY8 -> GL_R8;
-                    case GLImage.FORMAT_RGBA32F -> GL_RGBA32F;
-                    default -> GL_RGBA8;
-                };
-                GL.glTexStorage2D(GL_TEXTURE_2D, 1, internal, width, height);
-                GL.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-                // One channel, read as alpha or as gray
-                if (texFormat == GLImage.FORMAT_ALPHA8) {
-                    GL.glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleAlpha);
-                } else if (texFormat == GLImage.FORMAT_GRAY8) {
-                    GL.glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleGray);
-                }
-                GL.glBindTexture(GL_TEXTURE_2D, 0);
-            }
+        if (exportable && !exportSupported) {
+            return null;
         }
-        if (renderTarget || exportable) {
-            int fb = framebufferOf(img);
-            int status = GL.glCheckFramebufferStatus(GL_FRAMEBUFFER);
-            if (status != GL_FRAMEBUFFER_COMPLETE) {
-                log("incomplete framebuffer 0x" + Integer.toHexString(status) + " for " + width + "x" + height);
-                destroyImage(img);
-                return null;
-            }
-            if (fb == 0) {
-                destroyImage(img);
-                return null;
-            }
-        }
-        if (GL.glGetError() != GL_NO_ERROR) {
+        boolean created = exportable ? createExported(img) : createTexture(img);
+        if (!created || ((renderTarget || exportable) && !hasCompleteFramebuffer(img))
+                || GL.glGetError() != GL_NO_ERROR) {
+            // Releases what was created: the texture, or the buffer, its fd and its EGL image
             destroyImage(img);
             return null;
         }
         return img;
     }
 
+    /** The texture of an image, multisampled or with the format of the image. */
+    private boolean createTexture(GLImage img) {
+        img.texture = gen(GL::glGenTextures);
+        if (img.samples > 1) {
+            GL.glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, img.texture);
+            GL.glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, img.samples, GL_RGBA8, img.width, img.height,
+                    (byte) 1);
+            GL.glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 0);
+            return true;
+        }
+        GL.glBindTexture(GL_TEXTURE_2D, img.texture);
+        GL.glTexStorage2D(GL_TEXTURE_2D, 1, internalFormat(img.texFormat), img.width, img.height);
+        GL.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        // One channel, read as alpha or as gray
+        if (img.texFormat == GLImage.FORMAT_ALPHA8) {
+            GL.glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleAlpha);
+        } else if (img.texFormat == GLImage.FORMAT_GRAY8) {
+            GL.glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleGray);
+        }
+        GL.glBindTexture(GL_TEXTURE_2D, 0);
+        return true;
+    }
+
+    private static int internalFormat(int texFormat) {
+        return switch (texFormat) {
+            case GLImage.FORMAT_ALPHA8, GLImage.FORMAT_GRAY8 -> GL_R8;
+            case GLImage.FORMAT_RGBA32F -> GL_RGBA32F;
+            default -> GL_RGBA8;
+        };
+    }
+
+    private boolean hasCompleteFramebuffer(GLImage img) {
+        int fb = framebufferOf(img);
+        int status = GL.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            log("incomplete framebuffer 0x" + Integer.toHexString(status) + " for " + img.width + "x" + img.height);
+            return false;
+        }
+        return fb != 0;
+    }
+
+    /**
+     * A linear buffer of the render node, exported as a dma-buf and imported
+     * back as an EGL image, which a texture is bound to.
+     */
     private boolean createExported(GLImage img) {
         MemorySegment bo = GBM.gbm_bo_create(gbm, img.width, img.height, DRM_FORMAT_ARGB8888,
                 GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
@@ -1093,17 +1157,7 @@ final class GLDevice {
         if (img.fd < 0) {
             return false;
         }
-        try (Arena a = Arena.ofConfined()) {
-            MemorySegment attribs = a.allocateFrom(JAVA_INT,
-                    EGL_WIDTH, img.width, EGL_HEIGHT, img.height,
-                    EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
-                    EGL_DMA_BUF_PLANE0_FD_EXT, img.fd,
-                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-                    EGL_DMA_BUF_PLANE0_PITCH_EXT, img.stride,
-                    EGL_NONE);
-            img.eglImage = EGLX.eglCreateImageKHR(display, MemorySegment.NULL, EGL_LINUX_DMA_BUF_EXT,
-                    MemorySegment.NULL, attribs);
-        }
+        img.eglImage = importDmaBuf(img);
         if (img.eglImage.address() == 0) {
             log("cannot import the exported buffer (EGL error 0x" + Integer.toHexString(EGL.eglGetError()) + ")");
             return false;
@@ -1115,6 +1169,20 @@ final class GLDevice {
         GL.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         GL.glBindTexture(GL_TEXTURE_2D, 0);
         return true;
+    }
+
+    private MemorySegment importDmaBuf(GLImage img) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment attribs = a.allocateFrom(JAVA_INT,
+                    EGL_WIDTH, img.width, EGL_HEIGHT, img.height,
+                    EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
+                    EGL_DMA_BUF_PLANE0_FD_EXT, img.fd,
+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                    EGL_DMA_BUF_PLANE0_PITCH_EXT, img.stride,
+                    EGL_NONE);
+            return EGLX.eglCreateImageKHR(display, MemorySegment.NULL, EGL_LINUX_DMA_BUF_EXT,
+                    MemorySegment.NULL, attribs);
+        }
     }
 
     private void createDepth(GLImage img) {
@@ -1142,6 +1210,12 @@ final class GLDevice {
         if (target == img) {
             target = null;
         }
+        deleteGLObjects(img);
+        releaseExport(img);
+    }
+
+    /** The framebuffer, the depth buffer and the texture of an image. */
+    private void deleteGLObjects(GLImage img) {
         if (img.framebuffer != 0) {
             if (boundFramebuffer == img.framebuffer) {
                 boundFramebuffer = -1;
@@ -1153,6 +1227,10 @@ final class GLDevice {
         img.depthRenderbuffer = 0;
         delete(GL::glDeleteTextures, img.texture);
         img.texture = 0;
+    }
+
+    /** The EGL image, the dma-buf and the buffer of an exported image. */
+    private void releaseExport(GLImage img) {
         if (img.eglImage.address() != 0) {
             EGLX.eglDestroyImageKHR(display, img.eglImage);
             img.eglImage = MemorySegment.NULL;
@@ -1181,22 +1259,28 @@ final class GLDevice {
             return;
         }
         makeCurrent();
-        MemorySegment pixels = src;
-        int rowLength = stride / img.bytesPerPixel;
         if (stride % img.bytesPerPixel != 0) {
-            // Rows that are not a whole number of pixels: copy them packed
+            // Rows that are not a whole number of pixels: upload them packed
             int rowBytes = width * img.bytesPerPixel;
-            byte[] packed = new byte[rowBytes * height];
-            MemorySegment p = MemorySegment.ofArray(packed);
             long base = (long) srcy * stride + (long) srcx * img.bytesPerPixel;
-            for (int y = 0; y < height; y++) {
-                MemorySegment.copy(src, base + (long) y * stride, p, (long) y * rowBytes, rowBytes);
-            }
-            pixels = p;
-            rowLength = width;
-            srcx = 0;
-            srcy = 0;
+            uploadRect(img, packRows(src, base, stride, rowBytes, height), dstx, dsty, 0, 0, width, height, width);
+        } else {
+            uploadRect(img, src, dstx, dsty, srcx, srcy, width, height, stride / img.bytesPerPixel);
         }
+        statUploads++;
+    }
+
+    private static MemorySegment packRows(MemorySegment src, long base, int stride, int rowBytes, int height) {
+        MemorySegment packed = MemorySegment.ofArray(new byte[rowBytes * height]);
+        for (int y = 0; y < height; y++) {
+            MemorySegment.copy(src, base + (long) y * stride, packed, (long) y * rowBytes, rowBytes);
+        }
+        return packed;
+    }
+
+    /** Uploads a rectangle of pixels whose rows are rowLength pixels apart. */
+    private void uploadRect(GLImage img, MemorySegment pixels, int dstx, int dsty, int srcx, int srcy,
+                            int width, int height, int rowLength) {
         GL.glBindTexture(GL_TEXTURE_2D, img.texture);
         GL.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         GL.glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
@@ -1208,7 +1292,6 @@ final class GLDevice {
         GL.glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
         GL.glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
         GL.glBindTexture(GL_TEXTURE_2D, 0);
-        statUploads++;
     }
 
     /**
@@ -1254,26 +1337,22 @@ final class GLDevice {
             return null;
         }
         makeCurrent();
-        boolean shortIndices = indices instanceof short[];
         MeshBuffers mesh = new MeshBuffers();
         mesh.vertexArray = gen(GL::glGenVertexArrays);
         GL.glBindVertexArray(mesh.vertexArray);
         mesh.vertexBuffer = gen(GL::glGenBuffers);
         GL.glBindBuffer(GL_ARRAY_BUFFER, mesh.vertexBuffer);
         GL.glBufferData(GL_ARRAY_BUFFER, vertexCount * 4L, MemorySegment.ofArray(vertices), GL_STATIC_DRAW);
-        int stride = MESH_VERTEX_FLOATS * 4;
         // Position, texture coordinates and the tangent frame as a quaternion
-        GL.glEnableVertexAttribArray(0);
-        GL.glVertexAttribPointer(0, 3, GL_FLOAT, (byte) 0, stride, 0);
-        GL.glEnableVertexAttribArray(1);
-        GL.glVertexAttribPointer(1, 2, GL_FLOAT, (byte) 0, stride, 12);
-        GL.glEnableVertexAttribArray(2);
-        GL.glVertexAttribPointer(2, 4, GL_FLOAT, (byte) 0, stride, 20);
+        int stride = MESH_VERTEX_FLOATS * 4;
+        floatAttribute(0, 3, stride, 0);
+        floatAttribute(1, 2, stride, 12);
+        floatAttribute(2, 4, stride, 20);
         mesh.indexBuffer = gen(GL::glGenBuffers);
         GL.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.indexBuffer);
-        MemorySegment data = shortIndices ? MemorySegment.ofArray((short[]) indices)
-                : MemorySegment.ofArray((int[]) indices);
-        GL.glBufferData(GL_ELEMENT_ARRAY_BUFFER, indexCount * (shortIndices ? 2L : 4L), data, GL_STATIC_DRAW);
+        boolean shortIndices = indices instanceof short[];
+        GL.glBufferData(GL_ELEMENT_ARRAY_BUFFER, indexCount * (shortIndices ? 2L : 4L), indexData(indices),
+                GL_STATIC_DRAW);
         GL.glBindVertexArray(0);
         mesh.indexType = shortIndices ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
         mesh.indexCount = indexCount;
@@ -1282,6 +1361,14 @@ final class GLDevice {
             return null;
         }
         return mesh;
+    }
+
+    private static MemorySegment indexData(Object indices) {
+        return switch (indices) {
+            case short[] s -> MemorySegment.ofArray(s);
+            case int[] i -> MemorySegment.ofArray(i);
+            default -> throw new IllegalArgumentException("Indices must be short[] or int[]");
+        };
     }
 
     void destroyMeshBuffers(MeshBuffers mesh) {

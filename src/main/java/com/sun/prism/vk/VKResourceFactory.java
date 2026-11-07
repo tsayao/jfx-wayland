@@ -203,51 +203,59 @@ class VKResourceFactory extends BaseShaderFactory {
     public Texture createTexture(MediaFrame frame) {
         frame.holdFrame();
         try {
-            int width = frame.getWidth();
-            int height = frame.getHeight();
-            int texWidth = frame.getEncodedWidth();
-            int texHeight = frame.getEncodedHeight();
-            PixelFormat texFormat = frame.getPixelFormat();
-            checkTextureSize(texWidth, texHeight);
-
-            if (texFormat == PixelFormat.MULTI_YCbCr_420) {
-                // Luma, chroma blue, chroma red and alpha planes
-                MultiTexture tex = new MultiTexture(texFormat, WrapMode.CLAMP_TO_EDGE, width, height);
-                for (int index = 0; index < frame.planeCount(); index++) {
-                    int subWidth = texWidth;
-                    int subHeight = texHeight;
-                    if (index == PixelFormat.YCBCR_PLANE_CHROMABLUE || index == PixelFormat.YCBCR_PLANE_CHROMARED) {
-                        subWidth /= 2;
-                        subHeight /= 2;
-                    }
-                    Texture subTex = createTexture(PixelFormat.BYTE_ALPHA, Usage.DYNAMIC, WrapMode.CLAMP_TO_EDGE,
-                                                   subWidth, subHeight);
-                    if (subTex == null) {
-                        tex.dispose();
-                        return null;
-                    }
-                    tex.setTexture(subTex, index);
-                }
-                if (frame.planeCount() == 3) {
-                    // The shader expects an alpha plane
-                    Texture subTex = createTexture(PixelFormat.BYTE_ALPHA, Usage.DYNAMIC, WrapMode.CLAMP_TO_EDGE,
-                                                   texWidth, texHeight);
-                    if (subTex == null) {
-                        tex.dispose();
-                        return null;
-                    }
-                    byte[] opaque = new byte[texWidth * texHeight];
-                    Arrays.fill(opaque, (byte) 0xff);
-                    subTex.update(ByteBuffer.wrap(opaque), PixelFormat.BYTE_ALPHA, 0, 0, 0, 0,
-                                  texWidth, texHeight, texWidth, true);
-                    tex.setTexture(subTex, 3);
-                }
-                return tex;
+            checkTextureSize(frame.getEncodedWidth(), frame.getEncodedHeight());
+            if (frame.getPixelFormat() == PixelFormat.MULTI_YCbCr_420) {
+                return createYCbCrTexture(frame);
             }
-            return createTexture(texFormat, Usage.DEFAULT, WrapMode.CLAMP_TO_EDGE, texWidth, texHeight);
+            return createTexture(frame.getPixelFormat(), Usage.DEFAULT, WrapMode.CLAMP_TO_EDGE,
+                    frame.getEncodedWidth(), frame.getEncodedHeight());
         } finally {
             frame.releaseFrame();
         }
+    }
+
+    /**
+     * The luma, chroma blue, chroma red and alpha planes of a YCbCr frame,
+     * as alpha textures; the chroma planes are half the size. A frame of
+     * three planes gets an opaque alpha plane, which the shader expects.
+     */
+    private Texture createYCbCrTexture(MediaFrame frame) {
+        int texWidth = frame.getEncodedWidth();
+        int texHeight = frame.getEncodedHeight();
+        MultiTexture tex = new MultiTexture(PixelFormat.MULTI_YCbCr_420, WrapMode.CLAMP_TO_EDGE,
+                frame.getWidth(), frame.getHeight());
+        for (int index = 0; index < frame.planeCount(); index++) {
+            boolean chroma = index == PixelFormat.YCBCR_PLANE_CHROMABLUE || index == PixelFormat.YCBCR_PLANE_CHROMARED;
+            Texture plane = alphaTexture(chroma ? texWidth / 2 : texWidth, chroma ? texHeight / 2 : texHeight);
+            if (plane == null) {
+                tex.dispose();
+                return null;
+            }
+            tex.setTexture(plane, index);
+        }
+        if (frame.planeCount() == 3) {
+            Texture alpha = opaqueAlphaTexture(texWidth, texHeight);
+            if (alpha == null) {
+                tex.dispose();
+                return null;
+            }
+            tex.setTexture(alpha, 3);
+        }
+        return tex;
+    }
+
+    private Texture alphaTexture(int width, int height) {
+        return createTexture(PixelFormat.BYTE_ALPHA, Usage.DYNAMIC, WrapMode.CLAMP_TO_EDGE, width, height);
+    }
+
+    private Texture opaqueAlphaTexture(int width, int height) {
+        Texture alpha = alphaTexture(width, height);
+        if (alpha != null) {
+            byte[] opaque = new byte[width * height];
+            Arrays.fill(opaque, (byte) 0xff);
+            alpha.update(ByteBuffer.wrap(opaque), PixelFormat.BYTE_ALPHA, 0, 0, 0, 0, width, height, width, true);
+        }
+        return alpha;
     }
 
     @Override
