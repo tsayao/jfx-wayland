@@ -62,6 +62,8 @@ final class Gtk4Cursor extends Cursor {
      */
     GdkCursor getGdkCursor() {
         if (getType() == CURSOR_CUSTOM) {
+            // Glass creates a custom cursor when its native cursor is asked for
+            getNativeCursor();
             return gdkCursor;
         }
         return getType() == CURSOR_DEFAULT ? null : named(cursorName(getType()));

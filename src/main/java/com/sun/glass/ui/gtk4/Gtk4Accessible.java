@@ -54,7 +54,6 @@ import javafx.scene.Scene;
 import java.lang.foreign.AddressLayout;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
@@ -592,7 +591,7 @@ final class Gtk4Accessible extends Accessible {
     private static MemorySegment refreshCallback() {
         if (refreshCallback == null) {
             try {
-                refreshCallback = Linker.nativeLinker().upcallStub(
+                refreshCallback = Gtk4Upcalls.stub(
                         MethodHandles.lookup().findStatic(Gtk4Accessible.class, "refresh",
                                 MethodType.methodType(int.class, MemorySegment.class)),
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS),
@@ -1429,7 +1428,7 @@ final class Gtk4Accessible extends Accessible {
         private MemorySegment up(String name, FunctionDescriptor fd) throws ReflectiveOperationException {
             MethodType type = fd.toMethodType();
             MethodHandle mh = MethodHandles.lookup().findStatic(Gtk4Accessible.class, name, type);
-            return Linker.nativeLinker().upcallStub(mh, fd, arena);
+            return Gtk4Upcalls.stub(mh, fd, arena);
         }
 
         MemorySegment ref(MemorySegment obj) {

@@ -26,7 +26,6 @@ import com.sun.glass.ui.gtk4.wrappers.GLib;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
@@ -70,7 +69,7 @@ final class Gtk4Timer extends Timer {
                     .findStatic(Gtk4Timer.class, "timerTick",
                             MethodType.methodType(int.class, Object.class, MemorySegment.class));
 
-            MemorySegment stub = Linker.nativeLinker().upcallStub(
+            MemorySegment stub = Gtk4Upcalls.stub(
                     timerCallback.bindTo(runnable),
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS),
                     callbackArena);

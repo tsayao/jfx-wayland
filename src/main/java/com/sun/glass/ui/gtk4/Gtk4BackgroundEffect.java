@@ -407,7 +407,7 @@ final class Gtk4BackgroundEffect {
                 throws ReflectiveOperationException {
             MethodHandle handle = MethodHandles.lookup().findStatic(Gtk4BackgroundEffect.class, method,
                     descriptor.toMethodType());
-            return Linker.nativeLinker().upcallStub(handle, descriptor, arena);
+            return Gtk4Upcalls.stub(handle, descriptor, arena);
         }
 
         /** The interfaces of ext-background-effect-v1, which libwayland-client does not know. */

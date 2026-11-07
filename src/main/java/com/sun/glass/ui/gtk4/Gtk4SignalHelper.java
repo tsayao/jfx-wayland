@@ -27,7 +27,6 @@ import com.sun.glass.ui.gtk4.wrappers.GtkWidget;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -112,7 +111,7 @@ final class Gtk4SignalHelper {
             mh = MethodHandles.filterArguments(mh, 0, filters);
         }
 
-        return Linker.nativeLinker().upcallStub(mh, descriptor, arena);
+        return Gtk4Upcalls.stub(mh, descriptor, arena);
     }
 
     private static MethodHandle wrapperFactory(MethodHandles.Lookup lookup, Class<?> type) {
@@ -149,6 +148,8 @@ final class Gtk4SignalHelper {
      * Removes a controller installed through this helper.
      */
     void removeController(GtkEventController controller) {
+        // Its handlers keep a reference to it, and to their receiver
+        disconnectSignals(controller);
         for (var it = installedControllers.iterator(); it.hasNext(); ) {
             ControllerEntry ce = it.next();
             if (ce.controller().equals(controller)) {
@@ -164,6 +165,18 @@ final class Gtk4SignalHelper {
             widget.removeController(ce.controller());
         }
         ce.controller().unref();
+    }
+
+    /** Disconnects the handlers connected to the signals of an instance. */
+    void disconnectSignals(GObject instance) {
+        for (var it = signalConnections.iterator(); it.hasNext(); ) {
+            SignalConnection sc = it.next();
+            if (sc.instance().equals(instance)) {
+                it.remove();
+                GSignal.disconnect(sc.instance(), sc.handlerId());
+                sc.instance().unref();
+            }
+        }
     }
 
     void disconnectAllSignals() {

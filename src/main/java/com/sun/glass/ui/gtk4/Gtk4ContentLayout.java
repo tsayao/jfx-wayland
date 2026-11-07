@@ -26,7 +26,6 @@ import com.sun.glass.ui.gtk4.wrappers.GtkWidget;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
@@ -59,12 +58,12 @@ final class Gtk4ContentLayout {
         this.widget = widget;
         try {
             MethodHandles.Lookup lookup = MethodHandles.lookup();
-            MemorySegment measure = Linker.nativeLinker().upcallStub(
+            MemorySegment measure = Gtk4Upcalls.stub(
                     lookup.bind(this, "measure", MethodType.methodType(void.class,
                             MemorySegment.class, int.class, int.class,
                             MemorySegment.class, MemorySegment.class, MemorySegment.class, MemorySegment.class)),
                     MEASURE, arena);
-            MemorySegment allocate = Linker.nativeLinker().upcallStub(
+            MemorySegment allocate = Gtk4Upcalls.stub(
                     lookup.bind(this, "allocate", MethodType.methodType(void.class,
                             MemorySegment.class, int.class, int.class, int.class)),
                     ALLOCATE, arena);

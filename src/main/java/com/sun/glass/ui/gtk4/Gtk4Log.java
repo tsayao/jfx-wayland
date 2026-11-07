@@ -20,6 +20,7 @@
  */
 package com.sun.glass.ui.gtk4;
 
+import java.util.Locale;
 import java.util.Set;
 
 final class Gtk4Log {
@@ -52,13 +53,13 @@ final class Gtk4Log {
             String[] tokens = value.split(",");
             Set<Category> categories = new java.util.HashSet<>();
             for (String token : tokens) {
-                String t = token.trim().toLowerCase();
+                String t = token.trim().toLowerCase(Locale.ROOT);
                 if ("all".equals(t)) {
                     categories.addAll(Set.of(Category.values()));
                     break;
                 }
                 try {
-                    categories.add(Category.valueOf(t.toUpperCase()));
+                    categories.add(Category.valueOf(t.toUpperCase(Locale.ROOT)));
                 } catch (IllegalArgumentException ignored) {
                     System.err.println("[Gtk4Log] Unknown verbose category: " + token.trim());
                 }

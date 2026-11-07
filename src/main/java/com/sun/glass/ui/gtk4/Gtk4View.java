@@ -425,8 +425,12 @@ public class Gtk4View extends View {
             viewWidget.grabFocus();
         }
         int nPress = consecutivePresses(event);
+        // Only the release of the press that the window handled is dropped:
+        // when the compositor moves or resizes the window, it takes the
+        // release, which never comes
+        suppressRelease = false;
         if (window.handleExtendedButtonPress(event, button, nPress, x, y)) {
-            suppressRelease = button == Gdk.BUTTON_PRIMARY && nPress == 1;
+            suppressRelease = button == Gdk.BUTTON_PRIMARY;
             return true;
         }
         return false;

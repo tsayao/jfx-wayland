@@ -66,7 +66,7 @@ final class Gtk4Compositor {
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
         MemorySegment notify;
         try {
-            notify = linker.upcallStub(
+            notify = Gtk4Upcalls.stub(
                     MethodHandles.lookup().findStatic(Gtk4Compositor.class, "onExternalTextureDestroyed",
                             MethodType.methodType(void.class, MemorySegment.class)),
                     FunctionDescriptor.ofVoid(ValueLayout.ADDRESS),
@@ -97,7 +97,6 @@ final class Gtk4Compositor {
     private GdkTexture externalTexture;
     private final GtkPicture picture;
     private final GtkWidget widget;
-    private final boolean composited;
     private GdkTexture softwareTexture;
     private volatile boolean disposed;
 
@@ -126,30 +125,16 @@ final class Gtk4Compositor {
         picture.setContentFit(Gtk.CONTENT_FIT_FILL);
         picture.setCanShrink(true);
 
-        if (isAvailable()) {
-            this.composited = true;
-            GtkGraphicsOffload offloadRef = GtkGraphicsOffload.create(picture);
-            offloadRef.setEnabled(offload ? Gtk.GRAPHICS_OFFLOAD_ENABLED : Gtk.GRAPHICS_OFFLOAD_DISABLED);
-            this.widget = offloadRef;
-        } else {
-            this.composited = false;
-            this.widget = picture;
-        }
+        // Gtk4Application requires GtkGraphicsOffload and GdkDmabufTextureBuilder
+        GtkGraphicsOffload offloadRef = GtkGraphicsOffload.create(picture);
+        offloadRef.setEnabled(offload ? Gtk.GRAPHICS_OFFLOAD_ENABLED : Gtk.GRAPHICS_OFFLOAD_DISABLED);
+        this.widget = offloadRef;
 
         widget.setHExpand(true);
         widget.setVExpand(true);
         widget.setHAlign(Gtk.ALIGN_FILL);
         widget.setVAlign(Gtk.ALIGN_FILL);
     }
-
-    static boolean isAvailable() {
-        boolean graphicsOffloadAvailable = GtkGraphicsOffload.isAvailable();
-        boolean dmabufTextureBuilderAvailable = GdkDmabufTextureBuilder.isAvailable();
-
-        return graphicsOffloadAvailable
-                && dmabufTextureBuilderAvailable;
-    }
-
 
     public GtkWidget getWidget() {
         return widget;
@@ -183,7 +168,7 @@ final class Gtk4Compositor {
      */
     boolean publishDmaBuf(int fd, int stride, int offset, int fourcc, long modifier,
                           int width, int height, Runnable release) {
-        if (!composited || disposed || width <= 0 || height <= 0) {
+        if (disposed || width <= 0 || height <= 0) {
             return false;
         }
         int dup = dupFd(fd);
@@ -276,7 +261,7 @@ final class Gtk4Compositor {
 
     public void dispose() {
         disposed = true;
-        Gtk4Log.log(COMPOSITOR, "dispose: composited=%b", composited);
+        Gtk4Log.log(COMPOSITOR, "dispose");
 
         // Release the software-fallback texture (if used)
         if (softwareTexture != null) {
@@ -291,10 +276,6 @@ final class Gtk4Compositor {
         if (external != null) {
             release(external);
         }
-    }
-
-    boolean isComposited() {
-        return composited;
     }
 
     /**

@@ -96,6 +96,7 @@ public final class Gtk4Application extends Application {
     private Thread eventThread;
     private Gtk4SignalHelper appSignals;
     private Gtk4SignalHelper monitorSignals;
+    private Arena monitorArena;
     private Gtk4PlatformSupport platformSupport;
 
     public Gtk4Application() {
@@ -482,8 +483,11 @@ public final class Gtk4Application extends Application {
     private void connectPerMonitorSignals(GListModel monitors) {
         if (monitorSignals != null) {
             monitorSignals.disconnectAllSignals();
+            // The upcall stubs of the old monitors, released when no signal can use them
+            closeLater(monitorArena);
         }
-        monitorSignals = new Gtk4SignalHelper(Arena.global(), MethodHandles.lookup());
+        monitorArena = Arena.ofShared();
+        monitorSignals = new Gtk4SignalHelper(monitorArena, MethodHandles.lookup());
         int count = monitors.getNItems();
         for (int i = 0; i < count; i++) {
             GObject monitor = monitors.getObject(i);

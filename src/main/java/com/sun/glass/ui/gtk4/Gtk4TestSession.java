@@ -30,7 +30,6 @@ import com.sun.glass.ui.gtk4.wrappers.GVariantType;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
@@ -266,7 +265,7 @@ final class Gtk4TestSession {
     private static MemorySegment retryCallback() {
         if (retryCallback == null) {
             try {
-                retryCallback = Linker.nativeLinker().upcallStub(
+                retryCallback = Gtk4Upcalls.stub(
                         MethodHandles.lookup().findStatic(Gtk4TestSession.class, "retry",
                                 MethodType.methodType(int.class, MemorySegment.class)),
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS),

@@ -576,7 +576,7 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
             GtkPopover removed = popover;
             popover = null;
             if (Gtk4View.isDispatchingPress()) {
-                Application.invokeLater(() -> removePopover(removed));
+                removePopoverLater(removed);
             } else {
                 removePopover(removed);
             }
@@ -588,6 +588,26 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
             compositor.dispose();
             compositor = null;
         }
+    }
+
+    /**
+     * Removes the popover once the press being delivered to it is over (GTK
+     * grabs the pointer for its widget once the press is delivered). Until
+     * then a reference keeps it alive, even when its owner is destroyed
+     * meanwhile, and so does the arena of the upcalls of its widgets, such as
+     * the layout of its content, which is closed after the removal.
+     */
+    private void removePopoverLater(GtkPopover removed) {
+        removed.ref();
+        Arena arena = windowArena;
+        windowArena = null;
+        Application.invokeLater(() -> {
+            removePopover(removed);
+            removed.unref();
+            if (arena != null) {
+                Gtk4Application.closeLater(arena);
+            }
+        });
     }
 
     /** The arena of the upcall stubs, once no more signals can be delivered, and the widgets. */
@@ -1922,7 +1942,8 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
 
     @Override
     public boolean isComposited() {
-        return compositor != null && compositor.isComposited();
+        // Every window shows the dma-bufs of the pipelines through its compositor
+        return compositor != null;
     }
 
     @Override
