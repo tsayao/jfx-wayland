@@ -290,7 +290,7 @@ fi
 if [ "$COMPOSITOR" != none ]; then
     if [ "$TOOLBOX" != none ] && [ ! -f /run/.toolboxenv ]; then
         ensure_toolbox
-        relaunch toolbox run --container "$TOOLBOX" env GDK_DISABLE="$GDK_DISABLE" GSK_DEBUG="$GSK_DEBUG" \
+        relaunch toolbox run --container "$TOOLBOX" env GDK_DISABLE="$GDK_DISABLE" GDK_DEBUG="$GDK_DEBUG" GSK_DEBUG="$GSK_DEBUG" \
             LAUNCHER_OWNER="$LAUNCHER_OWNER"
         exit $?
     fi

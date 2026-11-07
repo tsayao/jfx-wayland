@@ -87,8 +87,10 @@ final class VKDevice {
     /** The size of the uniform block of the Phong shaders. */
     static final int PHONG_UNIFORM_FLOATS = 108;
 
-    // DRM_FORMAT_ARGB8888: B, G, R, A in memory
+    // DRM_FORMAT_ARGB8888: B, G, R, A in memory; XRGB8888 is the same with
+    // the alpha ignored, which GTK knows to be opaque
     static final long DRM_FORMAT_ARGB8888 = 0x34325241L;
+    static final long DRM_FORMAT_XRGB8888 = 0x34325258L;
     static final long DRM_FORMAT_MOD_LINEAR = 0L;
 
     // struct dma_buf_import_sync_file and its ioctl

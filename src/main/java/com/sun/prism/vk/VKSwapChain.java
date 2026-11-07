@@ -141,6 +141,11 @@ class VKSwapChain implements Presentable, VKRenderTarget, GraphicsResource {
         return composited ? presentDmaBuf() : presentPixels();
     }
 
+    /**
+     * Copies the frame into an exported image and publishes it. An opaque
+     * frame is published as XRGB8888, which GTK can then offload below the
+     * window when something of the window is drawn over the frame.
+     */
     private boolean presentDmaBuf() {
         if (!(pState.getWindow() instanceof DmaBufPresenter presenter)) {
             return false;
@@ -161,7 +166,8 @@ class VKSwapChain implements Presentable, VKRenderTarget, GraphicsResource {
         final int index = slot;
         final int generation = slotGeneration;
         boolean published = presenter.publishDmaBuf(exported.fd, (int) exported.rowPitch, (int) exported.offset,
-                (int) VKDevice.DRM_FORMAT_ARGB8888, VKDevice.DRM_FORMAT_MOD_LINEAR, w, h,
+                (int) (isOpaque() ? VKDevice.DRM_FORMAT_XRGB8888 : VKDevice.DRM_FORMAT_ARGB8888),
+                VKDevice.DRM_FORMAT_MOD_LINEAR, w, h,
                 () -> releaseSlot(index, generation));
         if (!published) {
             releaseSlot(index, generation);

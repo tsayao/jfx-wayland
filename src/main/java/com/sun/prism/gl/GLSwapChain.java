@@ -142,6 +142,11 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
         return composited ? presentDmaBuf() : presentPixels();
     }
 
+    /**
+     * Copies the frame into an exported image and publishes it. An opaque
+     * frame is published as XRGB8888, which GTK can then offload below the
+     * window when something of the window is drawn over the frame.
+     */
     private boolean presentDmaBuf() {
         if (!(pState.getWindow() instanceof DmaBufPresenter presenter)) {
             return false;
@@ -162,7 +167,7 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
         final int index = slot;
         final int generation = slotGeneration;
         boolean published = presenter.publishDmaBuf(exported.fd, exported.stride, 0,
-                exported.fourcc, GLDevice.DRM_FORMAT_MOD_LINEAR, w, h,
+                isOpaque() ? GLDevice.DRM_FORMAT_XRGB8888 : exported.fourcc, GLDevice.DRM_FORMAT_MOD_LINEAR, w, h,
                 () -> releaseSlot(index, generation));
         if (!published) {
             releaseSlot(index, generation);

@@ -81,6 +81,8 @@ final class GLDevice {
     static final int PHONG_UNIFORM_FLOATS = 108;
 
     static final int DRM_FORMAT_ARGB8888 = 0x34325241;
+    // The same with the alpha ignored, which GTK knows to be opaque
+    static final int DRM_FORMAT_XRGB8888 = 0x34325258;
     static final long DRM_FORMAT_MOD_LINEAR = 0L;
 
     // OpenGL
