@@ -1048,6 +1048,8 @@ final class VKDevice {
         if (target == null) {
             return false;
         }
+        // Rendering resumed into a target that is already an attachment
+        boolean resumed = target.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL && !target.foreign;
         transition(target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         boolean newDepth = false;
         if (target.hasDepth() && target.depthLayout != VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL) {
@@ -1055,6 +1057,9 @@ final class VKDevice {
             newDepth = true;
         }
         ensureRecording();
+        if (resumed) {
+            resumeBarrier(target, target.hasDepth() && !newDepth);
+        }
         long mark = scratch.mark();
         try {
             MemorySegment color = VkRenderingAttachmentInfo.allocate(scratch);
@@ -1086,6 +1091,46 @@ final class VKDevice {
             rendering = true;
             statRenderPasses++;
             return true;
+        } finally {
+            scratch.reset(mark);
+        }
+    }
+
+    /**
+     * Orders the load of the attachments of a new rendering after the stores
+     * of the previous rendering into them, which keeps their layout and so
+     * gets no layout transition.
+     */
+    private void resumeBarrier(VKImage img, boolean depth) {
+        long mark = scratch.mark();
+        try {
+            MemorySegment barriers = VkImageMemoryBarrier.allocateArray(scratch, depth ? 2 : 1);
+            MemorySegment color = VkImageMemoryBarrier.at(barriers, 0);
+            VkImageMemoryBarrier.srcAccessMask(color, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+            VkImageMemoryBarrier.dstAccessMask(color,
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+            VkImageMemoryBarrier.oldLayout(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            VkImageMemoryBarrier.newLayout(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            VkImageMemoryBarrier.srcQueueFamilyIndex(color, VK_QUEUE_FAMILY_IGNORED);
+            VkImageMemoryBarrier.dstQueueFamilyIndex(color, VK_QUEUE_FAMILY_IGNORED);
+            VkImageMemoryBarrier.image(color, img.image);
+            subresourceRange(VkImageMemoryBarrier.subresourceRange(color), VK_IMAGE_ASPECT_COLOR_BIT);
+            int stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            if (depth) {
+                MemorySegment d = VkImageMemoryBarrier.at(barriers, 1);
+                VkImageMemoryBarrier.srcAccessMask(d, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+                VkImageMemoryBarrier.dstAccessMask(d, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                        | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+                VkImageMemoryBarrier.oldLayout(d, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+                VkImageMemoryBarrier.newLayout(d, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+                VkImageMemoryBarrier.srcQueueFamilyIndex(d, VK_QUEUE_FAMILY_IGNORED);
+                VkImageMemoryBarrier.dstQueueFamilyIndex(d, VK_QUEUE_FAMILY_IGNORED);
+                VkImageMemoryBarrier.image(d, img.depthImage);
+                subresourceRange(VkImageMemoryBarrier.subresourceRange(d), depthAspect());
+                stages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            }
+            vkCmdPipelineBarrier(cmd, stages, stages, 0, 0, MemorySegment.NULL, 0, MemorySegment.NULL,
+                    depth ? 2 : 1, barriers);
         } finally {
             scratch.reset(mark);
         }

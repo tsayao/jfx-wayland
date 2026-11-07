@@ -305,6 +305,13 @@ public class Gtk4View extends View {
 
     int onEvent(GtkEventController controller, GdkEvent event) {
         int type = event.getEventType();
+        if ((type == Gdk.BUTTON_PRESS || type == Gdk.BUTTON_RELEASE || type == Gdk.MOTION_NOTIFY
+                || type == Gdk.SCROLL) && Gtk4Robot.isPickEvent(event.getTime())) {
+            // A click of the robot for the color picker of the desktop, which
+            // was not shown yet: the application does not get it
+            Gtk4Log.log(POINTER, "dropped an event of the color picker of the robot");
+            return 1;
+        }
         if (isBlocked() && type != Gdk.MOTION_NOTIFY) {
             // A modal window disables the others: their input is dropped, and a
             // press brings the modal window forward
@@ -646,6 +653,9 @@ public class Gtk4View extends View {
 
     void onEnter(GtkEventController controller, double x, double y) {
         Gtk4Robot.pointerAt(window, x, y);
+        if (isPickEvent(controller)) {
+            return;
+        }
         int ix = (int) x;
         int iy = (int) y;
         lastMouseX = ix;
@@ -668,7 +678,7 @@ public class Gtk4View extends View {
     }
 
     void onLeave(GtkEventController controller) {
-        if (!mouseEntered) {
+        if (!mouseEntered || isPickEvent(controller)) {
             return;
         }
         exitPointer();
@@ -679,6 +689,12 @@ public class Gtk4View extends View {
         Gtk4Log.log(POINTER_MOTION, "leave: (%d,%d)", lastMouseX, lastMouseY);
         notifyMouse(MouseEvent.EXIT, MouseEvent.BUTTON_NONE, lastMouseX, lastMouseY, xAbs, yAbs,
                 Gtk4KeyMap.toGlassModifier(state), false, false);
+    }
+
+    /** Whether the current event is one of the moves of the robot for the color picker. */
+    private static boolean isPickEvent(GtkEventController controller) {
+        GdkEvent event = controller.getCurrentEvent();
+        return !event.isNull() && Gtk4Robot.isPickEvent(event.getTime());
     }
 
     static Gtk4View getLastPressedView() {

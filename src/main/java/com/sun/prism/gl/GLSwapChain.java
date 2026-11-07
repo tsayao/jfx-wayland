@@ -65,6 +65,7 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
     private int slotWidth;
     private int slotHeight;
     private int nextSlot;
+    private boolean slotsCreated;
     // Incremented when the slots are recreated, so late releases are ignored
     private int slotGeneration;
 
@@ -146,6 +147,10 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
             return false;
         }
         ensureSlots(w, h);
+        if (!hasSlots()) {
+            // The exported images cannot be created: read the frames back instead
+            return presentPixels();
+        }
         int slot = acquireSlot();
         if (slot < 0) {
             // The compositor still holds all the buffers; keep the frame in the back buffer
@@ -177,7 +182,7 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
     }
 
     private void ensureSlots(int width, int height) {
-        if (slotWidth == width && slotHeight == height && slots[0] != null) {
+        if (slotWidth == width && slotHeight == height && slotsCreated) {
             return;
         }
         releaseSlots();
@@ -186,6 +191,17 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
         }
         slotWidth = width;
         slotHeight = height;
+        // Not retried for this size when the images cannot be created
+        slotsCreated = true;
+    }
+
+    private boolean hasSlots() {
+        for (GLImage slot : slots) {
+            if (slot != null && slot.fd >= 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private synchronized int acquireSlot() {
@@ -227,6 +243,7 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
                 slots[i] = null;
             }
         }
+        slotsCreated = false;
         synchronized (this) {
             slotGeneration++;
             for (int i = 0; i < SLOT_COUNT; i++) {

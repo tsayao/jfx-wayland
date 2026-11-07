@@ -194,7 +194,14 @@ final class GLDevice {
 
     private static String failure;
 
+    // Lives as long as the device: only for allocations made once, not per call
     private final Arena arena = Arena.ofShared();
+    // Reused by the calls on the render thread that pass or return small values
+    private final MemorySegment ints;
+    private final MemorySegment eglNone;
+    private final MemorySegment syncRequest;
+    private final MemorySegment swizzleAlpha;
+    private final MemorySegment swizzleGray;
     private final boolean verbose;
     private int drmFd = -1;
     private MemorySegment gbm = MemorySegment.NULL;
@@ -253,6 +260,11 @@ final class GLDevice {
     private GLDevice(boolean verbose) {
         this.verbose = verbose;
         this.transform = arena.allocate(64, 16);
+        this.ints = arena.allocate(JAVA_INT, 4);
+        this.eglNone = arena.allocateFrom(JAVA_INT, EGL_NONE);
+        this.syncRequest = arena.allocate(8, 4);
+        this.swizzleAlpha = arena.allocateFrom(JAVA_INT, GL_ZERO, GL_ZERO, GL_ZERO, GL_RED);
+        this.swizzleGray = arena.allocateFrom(JAVA_INT, GL_RED, GL_RED, GL_RED, GL_ONE);
         for (int i = 0; i < 16; i++) {
             transform.setAtIndex(JAVA_FLOAT, i, i % 5 == 0 ? 1f : 0f);
         }
@@ -452,9 +464,9 @@ final class GLDevice {
     }
 
     private int getInteger(int name) {
-        MemorySegment v = arena.allocate(JAVA_INT);
-        GL.glGetIntegerv(name, v);
-        return v.get(JAVA_INT, 0);
+        ints.set(JAVA_INT, 0, 0);
+        GL.glGetIntegerv(name, ints);
+        return ints.get(JAVA_INT, 0);
     }
 
     private boolean hasGLExtension(String name) {
@@ -474,14 +486,15 @@ final class GLDevice {
     }
 
     private int gen(Generator g) {
-        MemorySegment name = arena.allocate(JAVA_INT);
-        g.generate(1, name);
-        return name.get(JAVA_INT, 0);
+        ints.set(JAVA_INT, 0, 0);
+        g.generate(1, ints);
+        return ints.get(JAVA_INT, 0);
     }
 
     private void delete(Generator d, int name) {
         if (name != 0) {
-            d.generate(1, arena.allocateFrom(JAVA_INT, name));
+            ints.set(JAVA_INT, 0, name);
+            d.generate(1, ints);
         }
     }
 
@@ -973,8 +986,7 @@ final class GLDevice {
         if (!fenceSupported || exported.fd < 0) {
             return false;
         }
-        MemorySegment sync = EGLX.eglCreateSyncKHR(display, EGL_SYNC_NATIVE_FENCE_ANDROID,
-                arena.allocateFrom(JAVA_INT, EGL_NONE));
+        MemorySegment sync = EGLX.eglCreateSyncKHR(display, EGL_SYNC_NATIVE_FENCE_ANDROID, eglNone);
         if (sync.address() == 0) {
             fenceSupported = false;
             return false;
@@ -987,10 +999,9 @@ final class GLDevice {
                 fenceSupported = false;
                 return false;
             }
-            MemorySegment request = arena.allocate(8, 4);
-            request.set(JAVA_INT, 0, DMA_BUF_SYNC_WRITE);
-            request.set(JAVA_INT, 4, syncFd);
-            int result = LibC.ioctl(exported.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, request);
+            syncRequest.set(JAVA_INT, 0, DMA_BUF_SYNC_WRITE);
+            syncRequest.set(JAVA_INT, 4, syncFd);
+            int result = LibC.ioctl(exported.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, syncRequest);
             LibC.close(syncFd);
             if (result != 0) {
                 log("cannot attach the sync file to the dma-buf, waiting for the GPU");
@@ -1014,7 +1025,12 @@ final class GLDevice {
         makeCurrent();
         GLImage img = new GLImage(this, texFormat, width, height, samples, renderTarget, exportable);
         if (exportable) {
-            if (!exportSupported || !createExported(img)) {
+            if (!exportSupported) {
+                return null;
+            }
+            if (!createExported(img)) {
+                // Releases what was created: the buffer, its fd and its EGL image
+                destroyImage(img);
                 return null;
             }
         } else {
@@ -1034,11 +1050,9 @@ final class GLDevice {
                 GL.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
                 // One channel, read as alpha or as gray
                 if (texFormat == GLImage.FORMAT_ALPHA8) {
-                    GL.glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA,
-                            arena.allocateFrom(JAVA_INT, GL_ZERO, GL_ZERO, GL_ZERO, GL_RED));
+                    GL.glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleAlpha);
                 } else if (texFormat == GLImage.FORMAT_GRAY8) {
-                    GL.glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA,
-                            arena.allocateFrom(JAVA_INT, GL_RED, GL_RED, GL_RED, GL_ONE));
+                    GL.glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleGray);
                 }
                 GL.glBindTexture(GL_TEXTURE_2D, 0);
             }
@@ -1077,15 +1091,17 @@ final class GLDevice {
         if (img.fd < 0) {
             return false;
         }
-        MemorySegment attribs = arena.allocateFrom(JAVA_INT,
-                EGL_WIDTH, img.width, EGL_HEIGHT, img.height,
-                EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
-                EGL_DMA_BUF_PLANE0_FD_EXT, img.fd,
-                EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-                EGL_DMA_BUF_PLANE0_PITCH_EXT, img.stride,
-                EGL_NONE);
-        img.eglImage = EGLX.eglCreateImageKHR(display, MemorySegment.NULL, EGL_LINUX_DMA_BUF_EXT,
-                MemorySegment.NULL, attribs);
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment attribs = a.allocateFrom(JAVA_INT,
+                    EGL_WIDTH, img.width, EGL_HEIGHT, img.height,
+                    EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
+                    EGL_DMA_BUF_PLANE0_FD_EXT, img.fd,
+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                    EGL_DMA_BUF_PLANE0_PITCH_EXT, img.stride,
+                    EGL_NONE);
+            img.eglImage = EGLX.eglCreateImageKHR(display, MemorySegment.NULL, EGL_LINUX_DMA_BUF_EXT,
+                    MemorySegment.NULL, attribs);
+        }
         if (img.eglImage.address() == 0) {
             log("cannot import the exported buffer (EGL error 0x" + Integer.toHexString(EGL.eglGetError()) + ")");
             return false;

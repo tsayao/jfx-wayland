@@ -20,9 +20,8 @@
  */
 package com.sun.glass.ui.gtk4;
 
-import com.sun.glass.ui.Application;
-import com.sun.glass.ui.EventLoop;
 import com.sun.glass.ui.gtk4.wrappers.GDBusConnection;
+import com.sun.glass.ui.gtk4.wrappers.GMainContext;
 import com.sun.glass.ui.gtk4.wrappers.GUnixFDList;
 import com.sun.glass.ui.gtk4.wrappers.GVariant;
 import com.sun.glass.ui.gtk4.wrappers.GVariantType;
@@ -54,19 +53,20 @@ final class Gtk4RemoteDesktopPortal {
 
     private static final Gtk4Log.Category LOG = Gtk4Log.Category.FOCUS;
 
-    private static final String PORTAL = "org.freedesktop.portal.Desktop";
-    private static final String PORTAL_PATH = "/org/freedesktop/portal/desktop";
+    static final String PORTAL = "org.freedesktop.portal.Desktop";
+    static final String PORTAL_PATH = "/org/freedesktop/portal/desktop";
     private static final String REMOTE_DESKTOP = "org.freedesktop.portal.RemoteDesktop";
-    private static final String REQUEST = "org.freedesktop.portal.Request";
+    static final String REQUEST = "org.freedesktop.portal.Request";
 
     private static final int RESPONSE_SUCCESS = 0;
+    private static final int RESPONSE_CANCELLED = 1;
     private static final int DEVICE_KEYBOARD = 1;
     private static final int DEVICE_POINTER = 2;
     private static final int DEVICE_TOUCHSCREEN = 4;
     // Kept until the user revokes the permission
     private static final int PERSIST_PERMANENT = 2;
 
-    private static final FunctionDescriptor RESPONSE_CALLBACK = Gtk4SignalHelper.buildDescriptor(void.class,
+    static final FunctionDescriptor RESPONSE_CALLBACK = Gtk4SignalHelper.buildDescriptor(void.class,
             MemorySegment.class, MemorySegment.class, MemorySegment.class, MemorySegment.class, MemorySegment.class,
             GVariant.class, MemorySegment.class);
 
@@ -87,16 +87,25 @@ final class Gtk4RemoteDesktopPortal {
      *         user does not allow the session
      */
     static int connectToEis() {
-        if (bus == null) {
-            bus = Gio.busGetSync(Gio.G_BUS_TYPE_SESSION, null);
-        }
-        if (portalVersion() < 2) {
+        bus();
+        if (portalVersion(REMOTE_DESKTOP) < 2) {
             throw new UnsupportedOperationException(
                     "The robot needs the RemoteDesktop portal, version 2 (ConnectToEIS)");
         }
-        if (session == null) {
-            session = start();
+        if (session != null) {
+            try {
+                return connect(session);
+            } catch (RuntimeException e) {
+                // The compositor ended the session, as when it disconnected the robot
+                Gtk4Log.log(LOG, "remote desktop session %s ended: %s", session, e);
+                session = null;
+            }
         }
+        session = start();
+        return connect(session);
+    }
+
+    private static int connect(String session) {
         GVariant options = array("{sv}", new GVariant[0]);
         GUnixFDList[] fds = new GUnixFDList[1];
         GVariant reply = bus.callWithUnixFdListSync(PORTAL, PORTAL_PATH, REMOTE_DESKTOP, "ConnectToEIS",
@@ -118,10 +127,23 @@ final class Gtk4RemoteDesktopPortal {
         }
     }
 
-    private static int portalVersion() {
+    /**
+     * The session bus, shared by the clients of the portal.
+     */
+    static GDBusConnection bus() {
+        if (bus == null) {
+            bus = Gio.busGetSync(Gio.G_BUS_TYPE_SESSION, null);
+        }
+        return bus;
+    }
+
+    /**
+     * The version of an interface of the portal, or 0 when it has none.
+     */
+    static int portalVersion(String iface) {
         try {
-            GVariant reply = bus.callSync(PORTAL, PORTAL_PATH, "org.freedesktop.DBus.Properties", "Get",
-                    GVariant.createTuple(new GVariant[] {GVariant.createString(REMOTE_DESKTOP),
+            GVariant reply = bus().callSync(PORTAL, PORTAL_PATH, "org.freedesktop.DBus.Properties", "Get",
+                    GVariant.createTuple(new GVariant[] {GVariant.createString(iface),
                         GVariant.createString("version")}), null, Gio.G_DBUS_CALL_FLAGS_NONE, -1, null);
             GVariant boxed = reply.getChildValue(0);
             GVariant version = boxed.getVariant();
@@ -204,7 +226,8 @@ final class Gtk4RemoteDesktopPortal {
 
     /**
      * Calls a method of the portal that answers with a Request, and waits for
-     * its response in a nested event loop.
+     * its response, iterating the main context of the calling thread (that of
+     * the robot), where the response is subscribed.
      *
      * @param session the session handle, the first argument of the method, or null
      * @param parent the parent window, the second argument of the method, or null
@@ -254,8 +277,12 @@ final class Gtk4RemoteDesktopPortal {
                 if (waiter.results != null) {
                     waiter.results.unref();
                 }
-                throw new UnsupportedOperationException("The remote desktop portal refused " + method
-                        + " (response " + waiter.code + "): the robot needs the permission to control the desktop");
+                String message = "The remote desktop portal refused " + method + " (response " + waiter.code
+                        + "): the robot needs the permission to control the desktop";
+                // The user said no: the robot does not ask again. Otherwise,
+                // as when the dialog went away, it asks on its next call
+                throw waiter.code == RESPONSE_CANCELLED
+                        ? new UnsupportedOperationException(message) : new IllegalStateException(message);
             }
             return waiter.results;
         } catch (NoSuchMethodException | IllegalAccessException e) {
@@ -268,11 +295,11 @@ final class Gtk4RemoteDesktopPortal {
                 Gio.G_DBUS_SIGNAL_FLAGS_NO_MATCH_RULE, callback, null, null);
     }
 
-    private static GVariant entry(String key, GVariant value) {
+    static GVariant entry(String key, GVariant value) {
         return GVariant.createDictEntry(GVariant.createString(key), GVariant.createVariant(value));
     }
 
-    private static GVariant array(String elementType, GVariant[] children) {
+    static GVariant array(String elementType, GVariant[] children) {
         GVariantType type = GVariantType.create(elementType);
         try {
             return GVariant.createArray(type, children);
@@ -285,12 +312,12 @@ final class Gtk4RemoteDesktopPortal {
         private int code = -1;
         private GVariant results;
         private boolean done;
-        private EventLoop loop;
 
         void await() {
-            if (!done) {
-                loop = Application.GetApplication().createEventLoop();
-                loop.enter();
+            GMainContext context = Gtk4RobotThread.context();
+            while (!done) {
+                // The user may take a while to answer the dialog of the desktop
+                context.iteration(true);
             }
         }
 
@@ -305,9 +332,6 @@ final class Gtk4RemoteDesktopPortal {
             value.unref();
             results = parameters.getChildValue(1);
             done = true;
-            if (loop != null) {
-                loop.leave(null);
-            }
         }
     }
 }

@@ -22,6 +22,7 @@ package com.sun.glass.ui.gtk4;
 
 import com.sun.glass.events.KeyEvent;
 import com.sun.glass.ui.gtk4.wrappers.Gdk;
+import com.sun.glass.ui.gtk4.wrappers.GdkDevice;
 import com.sun.glass.ui.gtk4.wrappers.GdkDisplay;
 
 import java.util.HashMap;
@@ -411,6 +412,68 @@ final class Gtk4KeyMap {
         return toGlassKey(Gdk.keyvalToLower(keyval));
     }
 
+    /**
+     * The evdev keycode of the key that the robot presses for a Glass key:
+     * the key of the active layout whose keyval, without modifiers, has that
+     * key code (as {@link #getGlassKey} assigns them to the key events), or
+     * one that has it with Shift; on the first layout when the active one
+     * (e.g. Cyrillic) has none. The keys of the keypad, whose keyvals depend
+     * on Num Lock, and the keys that no layout has, come from a table of the
+     * evdev keycodes. Called on the event thread.
+     */
+    static int toRobotKeycode(int glassKey) {
+        if (!isNumpadKey(glassKey)) {
+            GdkDisplay display = GdkDisplay.getDefault();
+            int layout = activeLayout(display);
+            int keycode = findKeycode(display, glassKey, layout);
+            if (keycode < 0 && layout != 0) {
+                keycode = findKeycode(display, glassKey, 0);
+            }
+            if (keycode >= XKB_KEYCODE_OFFSET) {
+                return keycode - XKB_KEYCODE_OFFSET;
+            }
+        }
+        return toEvdevKeycode(glassKey);
+    }
+
+    // The keycodes of GDK on Wayland are those of XKB: evdev plus 8
+    private static final int XKB_KEYCODE_OFFSET = 8;
+    private static final int MAX_XKB_KEYCODE = 255;
+
+    private static int findKeycode(GdkDisplay display, int glassKey, int layout) {
+        for (int state : new int[] {0, GDK_SHIFT_MASK}) {
+            for (int keycode = XKB_KEYCODE_OFFSET; keycode <= MAX_XKB_KEYCODE; keycode++) {
+                int keyval = translate(display, keycode, state, layout);
+                // The keypad also has Enter, Home, the arrows...: the main keys come first
+                if (keyval != 0 && !isKeypad(keyval) && toGlassKey(keyval) == glassKey) {
+                    return keycode;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /** The layout of the keyboard in use, or the first one when GTK (before 4.18) does not tell. */
+    private static int activeLayout(GdkDisplay display) {
+        try {
+            GdkDevice keyboard = display.getDefaultSeat().getKeyboard();
+            return keyboard == null || keyboard.isNull() ? 0 : Math.max(keyboard.getActiveLayoutIndex(), 0);
+        } catch (RuntimeException e) {
+            return 0;
+        }
+    }
+
+    private static boolean isNumpadKey(int glassKey) {
+        return (glassKey >= KeyEvent.VK_NUMPAD0 && glassKey <= KeyEvent.VK_NUMPAD9)
+                || glassKey == KeyEvent.VK_MULTIPLY || glassKey == KeyEvent.VK_ADD
+                || glassKey == KeyEvent.VK_SUBTRACT || glassKey == KeyEvent.VK_DIVIDE
+                || glassKey == KeyEvent.VK_DECIMAL || glassKey == KeyEvent.VK_SEPARATOR;
+    }
+
+    /**
+     * The evdev keycodes of the keys of a US layout, for the keys that the
+     * active layout does not map.
+     */
     static int toEvdevKeycode(int glassKey) {
         if (glassKey >= KeyEvent.VK_A && glassKey <= KeyEvent.VK_Z) {
             int[] qwerty = {
@@ -464,6 +527,23 @@ final class Gtk4KeyMap {
             case KeyEvent.VK_COMMA -> 51;
             case KeyEvent.VK_PERIOD -> 52;
             case KeyEvent.VK_SLASH -> 53;
+            case KeyEvent.VK_NUMPAD0 -> 82;
+            case KeyEvent.VK_NUMPAD1 -> 79;
+            case KeyEvent.VK_NUMPAD2 -> 80;
+            case KeyEvent.VK_NUMPAD3 -> 81;
+            case KeyEvent.VK_NUMPAD4 -> 75;
+            case KeyEvent.VK_NUMPAD5 -> 76;
+            case KeyEvent.VK_NUMPAD6 -> 77;
+            case KeyEvent.VK_NUMPAD7 -> 71;
+            case KeyEvent.VK_NUMPAD8 -> 72;
+            case KeyEvent.VK_NUMPAD9 -> 73;
+            case KeyEvent.VK_MULTIPLY -> 55;
+            case KeyEvent.VK_ADD -> 78;
+            case KeyEvent.VK_SUBTRACT -> 74;
+            case KeyEvent.VK_DIVIDE -> 98;
+            case KeyEvent.VK_DECIMAL, KeyEvent.VK_SEPARATOR -> 83;
+            case KeyEvent.VK_ALT_GRAPH -> 100;
+            case KeyEvent.VK_CONTEXT_MENU -> 127;
             default -> -1;
         };
     }

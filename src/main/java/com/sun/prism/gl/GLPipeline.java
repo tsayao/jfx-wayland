@@ -91,9 +91,13 @@ public class GLPipeline extends GraphicsPipeline {
     @Override
     public void dispose() {
         if (factory != null) {
+            // Destroys the device
             factory.dispose();
             factory = null;
+        } else if (device != null) {
+            device.destroy();
         }
+        device = null;
         super.dispose();
     }
 

@@ -52,19 +52,56 @@ The shaders of both pipelines are generated from the JSL sources of JavaFX.
 ### Robot
 
 Wayland clients cannot inject input or read the screen, so
-`javafx.scene.robot.Robot` uses libei, the library of the compositors for
-emulated input. It gets its connection from the RemoteDesktop portal, which
-asks the user once for permission, or, in the nested GNOME Shell of the
-launcher, from its remote desktop session, without asking. Through libei it
-moves the pointer, clicks, scrolls, types and touches the screen. Pixels are
-read from the frames of the application windows themselves.
+`javafx.scene.robot.Robot` works as the libei robot of
+[jfx-tester](https://github.com/tsayao/jfx-tester) does. Its input goes
+through libei, the library of the compositors for emulated input, which gets
+its connection from the RemoteDesktop portal (asking the user once for
+permission, with a restore token for the next sessions), or, in a nested
+GNOME Shell of tests (`-Dglass.gtk4.testSession=gnome`), from its remote
+desktop session, without asking. Through libei it moves the pointer, clicks,
+scrolls, types and touches the screen; each event is sent in a frame and the
+compositor is pinged, so that it has processed the event when the call
+returns (libei 1.3; an older one, as in Ubuntu 24.04, gives the frame a
+moment instead), and a device that the compositor pauses for a moment is
+awaited. libei and the portal run on a thread of the robot, with a GLib main
+context of its own, so no event of the application is handled in the middle
+of a call of the robot (the connection and the screenshots, which may show a
+dialog of the desktop, keep the application responding meanwhile). When the
+compositor ends the connection, as when the session is revoked, the robot
+connects again; it stops asking only when the user refuses.
+
+The keys are those of the active layout: `keyPress(KeyCode.Q)` presses the
+key that types the key code `Q` on it (as the key events give the key
+codes), so that the robot types the same on QWERTY, AZERTY or ABNT2. A move
+over a window of the application waits until its view gets the pointer,
+instead of a fixed delay, and `getMouseX`/`getMouseY` give where the views
+last saw the pointer when the user moved it after the robot.
+
+The screen comes from the Screenshot portal, as libei cannot read it:
+
+- `getPixelColor` opens the color picker of the desktop (`PickColor`) and
+  clicks the point with the pointer, so it reads what the compositor shows
+  there, then puts the pointer back. The first click comes 80 ms after the
+  call (`-Dglass.gtk4.colorPicker.delay`, in milliseconds), and another one
+  every 400 ms while the picker has not answered, up to 8;
+- `getScreenCapture`, and `getPixelColor` when the picker does not work or a
+  button is held (which its click would release), crop a screenshot of all
+  the screens, which the portal saves in a file that is then deleted.
+
+The clicks of a pick that reach the application, before the picker is shown,
+are dropped by its views.
+
+When the portal fails once (or with `-Dglass.gtk4.colorPicker=false` and
+`-Dglass.gtk4.screenshot=false`), the pixels are read from the frames of the
+application windows themselves.
 
 ### Windows on Wayland
 
 Wayland does not let clients place their windows or know where they are. The
-glass follows this, except in the nested GNOME Shell of the tests, where it
-asks the shell to place its windows, which the tests of positions and of
-multiple monitors need.
+glass follows this, except in a nested GNOME Shell of tests
+(`-Dglass.gtk4.testSession=gnome`, as jfx-tester runs them), where it asks the
+shell to place its windows, which the tests of positions and of multiple
+monitors need.
 
 Everything else maps to GTK: windows and their decorations, input methods,
 clipboard and drag and drop, file dialogs through the portal, and
@@ -225,7 +262,7 @@ be removed.
 
 ## Demos
 
-`demos/` has three applications, which `launcher.sh` runs (see below):
+`demos/` has two applications, which `launcher.sh` runs (see below):
 
 - `eyecandy`, the showcases of the Prism renderer in one window, chosen in
   the middle of its header bar or with Ctrl+1 to Ctrl+5: Nebula (a planet, its
@@ -237,8 +274,7 @@ be removed.
   animations and menus. `./gradlew fxgl` downloads FXGL first, which the
   launcher then adds to the class path. The mouse or the arrows move the
   paddle, the click or Space launches the ball, and `-Dgames.autoplay=true`
-  plays by itself;
-- `tests`, the tests of the platform integration (see [Tests](#tests)).
+  plays by itself.
 
 ```
 ./launcher.sh
@@ -261,87 +297,20 @@ launcher does for `eyecandy`):
 
 ![Nebula on KDE Plasma](docs/images/plasma-eyecandy.jpg)
 
-![The tests app on KDE Plasma](docs/images/plasma-tests.jpg)
-
 ## Tests
 
-`tests` runs the tests of the GTK 4 glass and of the Prism pipelines, in a
-lab per area, after the manual tests and the system tests (`tests/system`) of
-OpenJFX. Each lab is a tab, with what it tests on one side and its table of
-tests on the other, which show OK, FAIL or SKIP; the overview shows the
-results of every lab, and Run all labs runs them one lab after the other.
-Every run can be stopped.
-
-![The tests app after a run](docs/images/tests.png)
-
-| Lab             | Tests                                                                    |
-|-----------------|--------------------------------------------------------------------------|
-| Robot           | `javafx.scene.robot.Robot`: pointer, buttons, wheel, keyboard, pixels and screen capture; the mouse location and the wheel scale (MouseLocationOnScreenTest, MouseWheelScaleTest) |
-| Windows         | Every window style, focus, maximized, full screen and minimized states before and after show, modality, min and max sizes, popups; sizeToScene, new scene sizes, iconify, redraw after deiconify, ownership, modal children, key events that close a stage, nested event loops and showAndWait (SizeToSceneTest, NewSceneSizeTest, IconifyTest, DrawAfterDeiconifyTest, DeiconifiedWithChildTest, StageOwnershipTest, SceneChangeShouldNotFocusStageTest, SetSceneScalingTest, KeyEventClosesStageTest, NestedEventLoopTest, ShowAndWaitTest) |
-| Screens         | Two monitors: stages, popups and dialogs on the second one, moves between them at different scales, maximized and full screen there; a monitor added and removed by hand, from the menu of the Mutter Development Kit |
-| Stage           | No tests: a stage playground (styles, owners, modality, properties, a title of emoji) |
-| Dialogs         | File and folder choosers (through the portal), extension filters, alerts, text input and choice dialogs, dialog sizes (DialogRepeatedShowHideTest, DialogWithOwnerSizingTest, MakeResizableAndResizeTest) |
-| Drag and drop   | Transfer modes and modifiers, data formats (with RTF and serialized objects), drag images and offsets, drops from and to other applications, full drag, colors between shapes, a context menu when a drag ends |
-| Clipboard       | Copy and paste of text, HTML, RTF, URLs, files, images and custom formats, checked by a second process and with `wl-copy` and `wl-paste` |
-| Render          | A showcase of shapes, paints, text, images, effects, blending, canvases, 3D and CSS, and sRGB colors, PixelBuffer updates, LCD text, snapshots (SRGBTest, PixelBufferDrawTest, TransparentLCDTest, Snapshot1Test) |
-| 3D              | 3D rendering checked on the screen and in snapshots, and the frame rate of heavier scenes; skipped on the `sw` pipeline |
-| Swing           | SwingNode painting and input, a JFXPanel in a JFrame, a non-focusable JFXPanel (NonFocusableJFXPanelTest), the EDT and FX threads, and the clipboard between Swing (X11, through Xwayland) and JavaFX |
-| Touch           | Touch points and the scroll, zoom and rotate gestures, with the touch screen of the robot; swipe with a touchpad |
-| Accessibility   | Accessible roles, names and states, live changes, and the AT-SPI tree read as a screen reader does |
-
-There are four kinds of tests (see `demos/TestKit.java`):
-
-- automatic tests check what the lab can do alone, such as reading back the
-  pixels of a window, the clipboard in a second process, or the AT-SPI tree of
-  the application with `python3` and the Atspi bindings;
-- robot tests drive the lab with `javafx.scene.robot.Robot`. The GTK 4 glass
-  generates robot input with libei: on the desktop of the user through the
-  RemoteDesktop portal, which asks once for the permission and then takes over
-  the pointer and the keyboard, or in the nested GNOME Shell of
-  `--compositor=gnome`, which leaves the desktop alone. `-Dtests.robot=false`
-  skips them, and they are skipped when the desktop has no robot input;
-- touch tests touch the lab with the touch screen that libei and the
-  compositor offer to the robot, when they do (GNOME 51 does);
-- manual tests wait for a device the robot does not have, such as a
-  touchpad: they pass when the lab sees their events, or with their OK and
-  FAIL buttons.
-
-### Running the tests
-
-The tests run best in the nested GNOME Shell of the launcher (GNOME 51, in a
-toolbox container, see [Launcher](#launcher)), where the robot does not take
-over the desktop and windows can be placed at given positions. With
-`--headless` the shell has no window at all, so that the desktop stays free
-and its focus does not matter, and it gets a second monitor at another scale
-for the Screens lab (which a shell with a window gets with
-`--monitors=1600x960@1,1280x800@2`, in a second window):
+The tests of the GTK 4 glass and of the Prism pipelines are in
+[jfx-tester](https://github.com/tsayao/jfx-tester), with the ones of the GTK 3
+glass: a lab per area (robot, windows, screens, stage, dialogs, drag and drop,
+clipboard, render, 3D, Swing, touch and accessibility), each an application
+of its own. Its `--wayland` option runs them with this plugin, on Wayland
+itself, in a nested GNOME Shell or KDE Plasma of a toolbox container, with
+`-Dglass.gtk4.testSession=gnome` under GNOME so that windows can be placed:
 
 ```
-./launcher.sh --apps=tests --compositor=gnome --headless -- -Dtests.run=true -Dtests.exit=true
+./jfx-tester --distros=fedora:45 --headless --tests=dnd,clipboard --wayland=$HOME/jfx-wayland
+./jfx-tester --distros=fedora:45 --desktops=gnome,kde --headless --tests=labs --wayland=$HOME/jfx-wayland
 ```
-
-`-Dtests.run=true` runs the tests at startup and `-Dtests.exit=true` exits
-afterwards, with status 1 when a test failed; each result is also printed, as
-`OK`, `FAIL` or `SKIP` lines, and as a summary per lab. Other options:
-
-| Option                          | Effect                                                     |
-|---------------------------------|------------------------------------------------------------|
-| `-Dtests.labs=robot,windows`    | Keeps only these labs, by name without spaces              |
-| `-Dtests.robot=false`           | Skips the robot tests                                      |
-| `--pipeline=vk\|gl\|sw`         | Runs them on one Prism pipeline                            |
-| `--monitors=1600x960@1,1280x800@2` | The monitors of the nested shell and their scales        |
-| `--screenshot=FILE`             | Saves a screenshot of the nested desktop (with `--headless`, then ends) |
-
-Without `--compositor`, the tests run on the current desktop, which asks once
-to allow the remote control of the robot; the Screens lab is skipped there:
-
-```
-./launcher.sh --apps=tests
-```
-
-The toolbox container gets the tools of the tests (`wl-clipboard`,
-`python3-gobject` and the AT-SPI registry of `at-spi2-core`) when it is
-created, and a container created before them gets them on the next run.
 
 ## Launcher
 
@@ -352,21 +321,20 @@ the plugin is built first with `./gradlew jar`.
 ```
 ./launcher.sh
 ./launcher.sh --apps=all --compositor=kde
-./launcher.sh --apps=tests --compositor=gnome --headless -- -Dtests.run=true -Dtests.exit=true
 ./launcher.sh --pipeline=sw --backdrop=off -- -Deyecandy.show=disco -Dglass.gtk4.verbose=all
 ```
 
 | Option                       | Description                                                     |
 |------------------------------|-----------------------------------------------------------------|
-| `--apps=a,b,...`             | Demos to run, `eyecandy` or `tests`, or `all` (`eyecandy`)     |
+| `--apps=a,b,...`             | Demos to run, `eyecandy` or `games`, or `all` (`eyecandy`)     |
 | `--compositor=none\|gnome\|kde\|hyprland` | Current desktop, or a nested compositor (`none`)        |
 | `--pipeline=auto\|vk\|gl\|sw`  | Prism pipeline: Vulkan, OpenGL 4.5 or software; `auto` tries them in that order (`auto`) |
-| `--backdrop=auto\|on\|off`    | Sets `glass.gtk4.backdrop`; `auto` turns it on for the demos and off for `tests` (`auto`) |
+| `--backdrop=auto\|on\|off`    | Sets `glass.gtk4.backdrop`; `auto` turns it on (`auto`) |
 | `--toolbox=NAME`             | Toolbox container of the compositor (`jfx-gnome51`, `jfx-kde`, `jfx-hyprland`), or `none` for the compositor of the host |
 | `--toolbox-release=N`        | Fedora release of a new toolbox container, a number or `rawhide` (gnome: `45`, kde and hyprland: `rawhide`) |
 | `--wallpaper=FILE`           | gnome: desktop image (the host wallpaper)                      |
 | `--size=WxH`, `--scale=N`    | gnome, kde, hyprland: size of the nested output (2400x1440); kde, hyprland: its scale |
-| `--monitors=WxH@S,...`       | gnome: monitors side by side, with their scales, each in a window of its own without `--headless` (`SIZE@1`; `tests` with `--headless`: `SIZE@1,1280x800@2`) |
+| `--monitors=WxH@S,...`       | gnome: monitors side by side, with their scales, each in a window of its own without `--headless` (`SIZE@1`) |
 | `--headless`                 | gnome: no window on the desktop, virtual monitors instead; the host focus does not matter |
 | `--screenshot=FILE`          | gnome, kde: screenshot of the nested desktop                   |
 | `--list`, `--help`           | Lists the demos, or shows all the options                      |

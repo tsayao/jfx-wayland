@@ -104,6 +104,11 @@ public final class Ei {
         invoke(H.EVENT_UNREF, event);
     }
 
+    /** Whether this libei has pings (1.3), which tell when the compositor processed the input. */
+    public static boolean isPingAvailable() {
+        return H.NEW_PING != null && H.PING != null && H.PING_UNREF != null && H.EVENT_PONG_GET_PING != null;
+    }
+
     public static MemorySegment newPing(MemorySegment ei) {
         return (MemorySegment) invoke(H.NEW_PING, ei);
     }

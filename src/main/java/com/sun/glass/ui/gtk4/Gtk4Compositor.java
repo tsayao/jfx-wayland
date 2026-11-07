@@ -48,10 +48,14 @@ import java.util.concurrent.atomic.AtomicReference;
 final class Gtk4Compositor {
 
     private static final Gtk4Log.Category COMPOSITOR = Gtk4Log.Category.COMPOSITOR;
-    private static final Arena DESTROY_CALLBACK_ARENA = Arena.global();
-
     private static final MethodHandle POSIX_DUP;
     private static final MethodHandle POSIX_CLOSE;
+
+    // Release callbacks of the external frames shown by all the windows, by
+    // texture token; one destroy notify serves them all
+    private static final Map<Long, Runnable> EXTERNAL_RELEASES = new ConcurrentHashMap<>();
+    private static final AtomicLong EXTERNAL_TOKENS = new AtomicLong(1);
+    private static final MemorySegment EXTERNAL_DESTROY_NOTIFY;
 
     static {
         Linker linker = Linker.nativeLinker();
@@ -60,6 +64,17 @@ final class Gtk4Compositor {
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
         POSIX_CLOSE = linker.downcallHandle(libc.find("close").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+        MemorySegment notify;
+        try {
+            notify = linker.upcallStub(
+                    MethodHandles.lookup().findStatic(Gtk4Compositor.class, "onExternalTextureDestroyed",
+                            MethodType.methodType(void.class, MemorySegment.class)),
+                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS),
+                    Arena.global());
+        } catch (NoSuchMethodException | IllegalAccessException e) {
+            notify = MemorySegment.NULL;
+        }
+        EXTERNAL_DESTROY_NOTIFY = notify;
     }
 
     private static int dupFd(int fd) {
@@ -79,10 +94,6 @@ final class Gtk4Compositor {
 
     private final AtomicReference<ExternalFrame> pendingExternal = new AtomicReference<>();
     private final AtomicBoolean externalUpdateScheduled = new AtomicBoolean(false);
-    // Release callbacks of the external frames shown, by texture token
-    private final Map<Long, Runnable> externalReleases = new ConcurrentHashMap<>();
-    private final AtomicLong externalTokens = new AtomicLong(1);
-    private final MemorySegment externalDestroyNotifyCb;
     private GdkTexture externalTexture;
     private final GtkPicture picture;
     private final GtkWidget widget;
@@ -129,18 +140,6 @@ final class Gtk4Compositor {
         widget.setVExpand(true);
         widget.setHAlign(Gtk.ALIGN_FILL);
         widget.setVAlign(Gtk.ALIGN_FILL);
-
-        MemorySegment externalCb;
-        try {
-            externalCb = Linker.nativeLinker().upcallStub(
-                    MethodHandles.lookup().bind(this, "onExternalTextureDestroyed",
-                            MethodType.methodType(void.class, MemorySegment.class)),
-                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS),
-                    DESTROY_CALLBACK_ARENA);
-        } catch (NoSuchMethodException | IllegalAccessException e) {
-            externalCb = MemorySegment.NULL;
-        }
-        this.externalDestroyNotifyCb = externalCb;
     }
 
     static boolean isAvailable() {
@@ -227,16 +226,16 @@ final class Gtk4Compositor {
         builder.setStride(0, frame.stride());
         builder.setOffset(0, frame.offset());
 
-        long token = externalTokens.getAndIncrement();
-        externalReleases.put(token, () -> {
+        long token = EXTERNAL_TOKENS.getAndIncrement();
+        EXTERNAL_RELEASES.put(token, () -> {
             closeFd(frame.fd());
             frame.release().run();
         });
-        GdkTexture texture = builder.build(externalDestroyNotifyCb, MemorySegment.ofAddress(token));
+        GdkTexture texture = builder.build(EXTERNAL_DESTROY_NOTIFY, MemorySegment.ofAddress(token));
         builder.unref();
         if (texture.isNull()) {
             Gtk4Log.log(COMPOSITOR, "showExternalFrame: cannot import the dma-buf");
-            Runnable cleanup = externalReleases.remove(token);
+            Runnable cleanup = EXTERNAL_RELEASES.remove(token);
             if (cleanup != null) {
                 cleanup.run();
             }
@@ -252,8 +251,8 @@ final class Gtk4Compositor {
     }
 
     @SuppressWarnings("unused")
-    void onExternalTextureDestroyed(MemorySegment data) {
-        Runnable cleanup = externalReleases.remove(data.address());
+    private static void onExternalTextureDestroyed(MemorySegment data) {
+        Runnable cleanup = EXTERNAL_RELEASES.remove(data.address());
         if (cleanup != null) {
             cleanup.run();
         }

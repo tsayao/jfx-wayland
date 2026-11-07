@@ -57,7 +57,7 @@
 #                           Prism pipeline: Vulkan, OpenGL 4.5 or software;
 #                           auto tries them in that order (auto)
 #   --backdrop=auto|on|off  blur the area behind the windows; auto blurs it
-#                           for the demos and not for the tests (auto)
+#                           (auto)
 #   --toolbox=NAME          toolbox container of the nested compositor
 #                           (jfx-gnome51, jfx-kde, jfx-hyprland), or "none" to use the
 #                           compositor of the host
@@ -69,9 +69,7 @@
 #   --scale=N               kde, hyprland: output scale (1)
 #   --monitors=WxH@S,...    gnome: monitors of the nested shell, side by side,
 #                           with their scales, each in a window of its own
-#                           without --headless (SIZE@1); with --headless the
-#                           tests get a second monitor at another scale for
-#                           their multi-monitor tests (SIZE@1,1280x800@2)
+#                           without --headless (SIZE@1)
 #   --headless              gnome: run the nested shell without a window, on
 #                           a virtual monitor of --size: nothing shows on the
 #                           desktop and the focus on the host does not matter
@@ -86,17 +84,13 @@
 # showcases of the Prism renderer in one window (-Deyecandy.show=fractals
 # starts on one), games, a Breakout made with FXGL, which ./gradlew fxgl
 # downloads first (-Dgames.autoplay=true plays by itself; "all" leaves it out
-# until then), and tests, which runs the tests of every lab, in a tab per
-# lab: -Dtests.run=true runs them at startup, -Dtests.exit=true exits
-# afterwards, with status 1 on a failure, and -Dtests.labs=robot,windows keeps
-# only some labs. Under GNOME the tests get -Dglass.gtk4.testSession=gnome, so
-# that the robot uses the remote desktop session of the nested shell.
+# until then). The tests of the glass are in jfx-tester
+# (https://github.com/tsayao/jfx-tester), whose --wayland option runs its labs
+# with this plugin.
 #
 # Examples:
 #   ./launcher.sh
 #   ./launcher.sh --apps=eyecandy --compositor=kde -- -Deyecandy.show=fractals
-#   ./launcher.sh --apps=tests
-#   ./launcher.sh --apps=tests --compositor=gnome --headless -- -Dtests.run=true -Dtests.exit=true
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
 # The first launcher, which the relaunched ones in the toolbox container and
@@ -113,10 +107,9 @@ TOOLBOX=
 TOOLBOX_RELEASE=
 # A COPR repository enabled in the container before installing
 TOOLBOX_COPR=
-# What the demos and the tests need, besides the compositor
+# What the demos need, besides the compositor
 TOOLBOX_PACKAGES="dbus-daemon java-25-openjdk-devel gtk4 libadwaita vulkan-loader mesa-vulkan-drivers \
-mesa-libgbm dejavu-sans-fonts google-noto-sans-fonts google-noto-color-emoji-fonts wl-clipboard python3-gobject \
-at-spi2-core"
+mesa-libgbm dejavu-sans-fonts google-noto-sans-fonts google-noto-color-emoji-fonts at-spi2-core"
 WALLPAPER=
 SIZE=2400x1440
 SCALE=1
@@ -247,8 +240,7 @@ ensure_toolbox() {
         exit 1
     fi
     if podman container exists "$TOOLBOX" 2>/dev/null; then
-        # A container created before a package joined the list, such as the
-        # AT-SPI registry of the accessibility tests, gets it now
+        # A container created before a package joined the list gets it now
         missing=$(toolbox run --container "$TOOLBOX" sh -c \
             'for p in "$@"; do rpm -q "$p" > /dev/null 2>&1 || printf "%s " "$p"; done' sh $TOOLBOX_PACKAGES)
         if [ -n "$missing" ]; then
@@ -491,16 +483,7 @@ picture-options='zoom'
 EOF
     export GSETTINGS_BACKEND=keyfile
 
-    if [ -z "$MONITORS" ]; then
-        MONITORS=$SIZE@1
-        # The devkit shows each monitor in a window of its own: the second
-        # monitor of the tests is for the headless shell only
-        if [ -n "$HEADLESS" ]; then
-            case ",$APPS," in
-                *,tests,*|*,all,*) MONITORS="$SIZE@1,1280x800@2" ;;
-            esac
-        fi
-    fi
+    [ -z "$MONITORS" ] && MONITORS=$SIZE@1
     set --
     devkit=
     for m in $(printf '%s' "$MONITORS" | tr ',' ' '); do
@@ -534,20 +517,8 @@ EOF
     sleep 1
 
     export WAYLAND_DISPLAY=$SOCKET GDK_BACKEND=wayland XDG_CURRENT_DESKTOP=GNOME
-    # The X display of the Xwayland of the nested shell, started on demand, for
-    # Swing; GTK stays on Wayland
-    DISPLAY=$(gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
-        --method org.gnome.Shell.Eval "imports.gi.GLib.getenv('DISPLAY') ?? ''" 2>/dev/null \
-        | sed -n "s/^(true, '\"\(.*\)\"')$/\1/p")
-    XAUTHORITY=$(gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
-        --method org.gnome.Shell.Eval "imports.gi.GLib.getenv('XAUTHORITY') ?? ''" 2>/dev/null \
-        | sed -n "s/^(true, '\"\(.*\)\"')$/\1/p")
-    if [ -n "$DISPLAY" ]; then
-        export DISPLAY
-        [ -n "$XAUTHORITY" ] && export XAUTHORITY
-    else
-        unset DISPLAY
-    fi
+    # The demos are Wayland clients only
+    unset DISPLAY XAUTHORITY
     dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP > /dev/null 2>&1
     start_atspi
     if [ -n "$SCREENSHOT" ]; then
@@ -561,7 +532,7 @@ EOF
 }
 
 # The bus of AT-SPI activates its registry through systemd, which the private
-# session does not have: start it here, for screen readers and the tests
+# session does not have: start it here, for screen readers
 start_atspi() {
     if [ -x /usr/libexec/at-spi2-registryd ]; then
         (/usr/libexec/at-spi2-registryd) > "$LOGS/atspi.log" 2>&1 &
@@ -668,19 +639,15 @@ start_$COMPOSITOR
 
 for class in $CLASSES; do
     name=$(printf '%s' "${class%Demo}" | tr '[:upper:]' '[:lower:]')
-    # The tests run without the backdrop unless it is asked for
     backdrop=$BACKDROP
-    [ "$backdrop" = auto ] && { [ "$class" = TestsDemo ] && backdrop=off || backdrop=on; }
+    [ "$backdrop" = auto ] && backdrop=on
     [ "$backdrop" = on ] && BACKDROP_OPTION=-Dglass.gtk4.backdrop=true || BACKDROP_OPTION=-Dglass.gtk4.backdrop=false
-    # The robot generates input through the remote desktop session of GNOME
-    TEST_SESSION=
+    DEMO_OPTIONS=
     case "$class" in
-        TestsDemo)
-            [ "$COMPOSITOR" = gnome ] && TEST_SESSION=-Dglass.gtk4.testSession=gnome ;;
         EyeCandyDemo)
             # Its extended windows have no title bar of GTK, where the blur
             # area that KWin offsets shows the most
-            TEST_SESSION=-Dglass.gtk4.backdrop.kwin=true ;;
+            DEMO_OPTIONS=-Dglass.gtk4.backdrop.kwin=true ;;
     esac
     # The compiled demos, and for the games FXGL, join the plugin on the class path
     extra=$DEMO_CLASSES
@@ -688,7 +655,7 @@ for class in $CLASSES; do
     sed '/^"-cp"$/{n;s|"$|:'"$extra"'"|}' "$RUN_ARGS" > "$LOGS/$name.args"
     (RUN_ARGS=$LOGS/$name.args
      run -Dprism.verbose=true -Djavafx.enablePreview=true \
-        -Djavafx.suppressPreviewWarning=true $TEST_SESSION $JVM_OPTIONS "$class" 2>&1 \
+        -Djavafx.suppressPreviewWarning=true $DEMO_OPTIONS $JVM_OPTIONS "$class" 2>&1 \
         | tee "$LOGS/$name.log" | sed -u "s/^/[$name] /") &
     PIDS="$PIDS $!"
 done
