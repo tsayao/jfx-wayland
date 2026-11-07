@@ -428,20 +428,27 @@ public class VulkanBindingsGeneratorTask extends DefaultTask {
         return type;
     }
 
+    /** The kind of a C scalar type, or null for void and the other types. */
+    private static Kind scalarKind(String type) {
+        return switch (type) {
+            case "char", "int8_t", "uint8_t" -> Kind.BYTE;
+            case "int16_t", "uint16_t" -> Kind.SHORT;
+            case "int", "int32_t", "uint32_t", "VkBool32", "VkFlags", "VkSampleMask" -> Kind.INT;
+            case "int64_t", "uint64_t", "size_t", "VkDeviceSize", "VkDeviceAddress", "VkFlags64" -> Kind.LONG;
+            case "float" -> Kind.FLOAT;
+            case "double" -> Kind.DOUBLE;
+            default -> null;
+        };
+    }
+
     private Kind kindOf(String type, int pointers) {
         if (pointers > 0) {
             return Kind.ADDRESS;
         }
         type = resolveType(type);
-        switch (type) {
-            case "char", "int8_t", "uint8_t": return Kind.BYTE;
-            case "int16_t", "uint16_t": return Kind.SHORT;
-            case "int", "int32_t", "uint32_t", "VkBool32", "VkFlags", "VkSampleMask": return Kind.INT;
-            case "int64_t", "uint64_t", "size_t", "VkDeviceSize", "VkDeviceAddress", "VkFlags64": return Kind.LONG;
-            case "float": return Kind.FLOAT;
-            case "double": return Kind.DOUBLE;
-            case "void": return null;
-            default: break;
+        Kind scalar = scalarKind(type);
+        if (scalar != null || type.equals("void")) {
+            return scalar;
         }
         String category = typeCategory.get(type);
         if (category == null) {

@@ -629,18 +629,18 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
     }
 
     private static Layout scalarLayout(String javaType) {
-        switch (javaType) {
-            case "byte":   return new Layout("ValueLayout.JAVA_BYTE", 1, 1, javaType);
-            case "short":  return new Layout("ValueLayout.JAVA_SHORT", 2, 2, javaType);
-            case "int":    return new Layout("ValueLayout.JAVA_INT", 4, 4, javaType);
-            case "long":   return new Layout("ValueLayout.JAVA_LONG", 8, 8, javaType);
-            case "float":  return new Layout("ValueLayout.JAVA_FLOAT", 4, 4, javaType);
-            case "double": return new Layout("ValueLayout.JAVA_DOUBLE", 8, 8, javaType);
-            case "boolean": return scalarLayout("int");
-            case "String": return scalarLayout("MemorySegment");
-            case "MemorySegment": return new Layout("ValueLayout.ADDRESS", 8, 8, javaType);
-            default: return null;
-        }
+        return switch (javaType) {
+            case "byte" -> new Layout("ValueLayout.JAVA_BYTE", 1, 1, javaType);
+            case "short" -> new Layout("ValueLayout.JAVA_SHORT", 2, 2, javaType);
+            case "int" -> new Layout("ValueLayout.JAVA_INT", 4, 4, javaType);
+            case "long" -> new Layout("ValueLayout.JAVA_LONG", 8, 8, javaType);
+            case "float" -> new Layout("ValueLayout.JAVA_FLOAT", 4, 4, javaType);
+            case "double" -> new Layout("ValueLayout.JAVA_DOUBLE", 8, 8, javaType);
+            case "boolean" -> scalarLayout("int");
+            case "String" -> scalarLayout("MemorySegment");
+            case "MemorySegment" -> new Layout("ValueLayout.ADDRESS", 8, 8, javaType);
+            default -> null;
+        };
     }
 
     private Layout compoundLayout(Element compound, String ns, Set<String> visiting) {
@@ -1330,9 +1330,7 @@ public class Gtk4WrapperGeneratorTask extends DefaultTask {
             invokeImports.add("rethrow");
             invokeImports.add("readString");
         }
-        List<String> sortedImports = new ArrayList<>(invokeImports);
-        Collections.sort(sortedImports);
-        for (String imp : sortedImports) {
+        for (String imp : invokeImports.stream().sorted().toList()) {
             sb.append("import static ").append(packageName).append(".NativeSymbolLookup.").append(imp).append(";\n");
         }
         if (!invokeImports.isEmpty()) sb.append("\n");
