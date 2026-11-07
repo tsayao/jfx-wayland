@@ -90,6 +90,11 @@ class GLTexture<T extends GLTextureData> extends BaseTexture<GLTextureResource<T
         if (!resource.isValid()) {
             return;
         }
+        if (!skipFlush) {
+            // The quads batched before the update, which may sample the texture,
+            // are drawn with its old pixels
+            context.flushVertexBuffer();
+        }
         switch (format) {
             case BYTE_RGB -> updateRGB((ByteBuffer) buffer, dstx, dsty, srcx, srcy, srcw, srch, srcscan);
             default -> upload(buffer, dstx, dsty, srcx, srcy, srcw, srch, srcscan);

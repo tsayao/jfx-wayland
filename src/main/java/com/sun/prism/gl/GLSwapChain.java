@@ -52,6 +52,10 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
     private final float pixelScaleFactorX;
     private final float pixelScaleFactorY;
     private final boolean composited;
+    // The window could not show a frame of a dma-buf: its pixels are presented instead
+    private boolean dmabufFailed;
+    // A frame was dropped as the compositor held every buffer (guarded by this)
+    private boolean repaintOnRelease;
     private final QueuedPixelSource pixelSource = new QueuedPixelSource(false);
 
     private GLRTTexture stableBackbuffer;
@@ -139,7 +143,7 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
         if (context.isDisposed() || stableBackbuffer == null) {
             return false;
         }
-        return composited ? presentDmaBuf() : presentPixels();
+        return composited && !dmabufFailed ? presentDmaBuf() : presentPixels();
     }
 
     /**
@@ -158,8 +162,12 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
         }
         int slot = acquireSlot();
         if (slot < 0) {
-            // The compositor still holds all the buffers; keep the frame in the back buffer
+            // The compositor still holds all the buffers: the frame is dropped, and
+            // painted again once a buffer comes back
             context.flush();
+            synchronized (this) {
+                repaintOnRelease = true;
+            }
             return true;
         }
         GLImage exported = slots[slot];
@@ -169,10 +177,12 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
         boolean published = presenter.publishDmaBuf(exported.fd, exported.stride, 0,
                 isOpaque() ? GLDevice.DRM_FORMAT_XRGB8888 : exported.fourcc, GLDevice.DRM_FORMAT_MOD_LINEAR, w, h,
                 () -> releaseSlot(index, generation));
-        if (!published) {
-            releaseSlot(index, generation);
+        if (published) {
+            return true;
         }
-        return published;
+        releaseSlot(index, generation);
+        dmabufFailed = true;
+        return presentPixels();
     }
 
     private boolean presentPixels() {
@@ -233,10 +243,20 @@ class GLSwapChain implements Presentable, GLRenderTarget, GraphicsResource {
         }
     }
 
-    private synchronized void releaseSlot(int index, int generation) {
-        if (generation == slotGeneration) {
+    /** A buffer came back; the frame dropped meanwhile is asked for again. */
+    private void releaseSlot(int index, int generation) {
+        boolean repaint;
+        synchronized (this) {
+            if (generation != slotGeneration) {
+                return;
+            }
             slotBusy[index] = false;
             notifyAll();
+            repaint = repaintOnRelease;
+            repaintOnRelease = false;
+        }
+        if (repaint && pState.getWindow() instanceof DmaBufPresenter presenter) {
+            presenter.requestRepaint();
         }
     }
 

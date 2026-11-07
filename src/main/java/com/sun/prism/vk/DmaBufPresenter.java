@@ -25,6 +25,19 @@ public interface DmaBufPresenter {
 
     boolean isComposited();
 
+    /**
+     * Shows a frame in a dma-buf, whose descriptor stays owned by the caller.
+     *
+     * @param release called when the window no longer reads the buffer
+     * @return false when the window cannot show the frame, as when it could
+     *     not import an earlier one: the caller presents its pixels instead
+     */
     boolean publishDmaBuf(int fd, int stride, int offset, int fourcc, long modifier,
                           int width, int height, Runnable release);
+
+    /**
+     * Asks for the whole window to be painted again, as a frame that could not
+     * be shown was dropped. Called on any thread.
+     */
+    void requestRepaint();
 }

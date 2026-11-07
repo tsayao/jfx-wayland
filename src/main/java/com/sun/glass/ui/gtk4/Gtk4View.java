@@ -738,6 +738,11 @@ public class Gtk4View extends View {
         return !event.isNull() && Gtk4Robot.isPickEvent(event.getTime());
     }
 
+    /** Asks Glass to paint the whole view again. */
+    void repaint() {
+        notifyRepaint(0, 0, getWidth(), getHeight());
+    }
+
     static Gtk4View getLastPressedView() {
         return lastPressedView;
     }

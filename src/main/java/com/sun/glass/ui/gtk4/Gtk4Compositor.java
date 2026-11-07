@@ -99,6 +99,9 @@ final class Gtk4Compositor {
     private final GtkWidget widget;
     private GdkTexture softwareTexture;
     private volatile boolean disposed;
+    // GTK could not import a dma-buf of the pipeline, as one in the memory of
+    // another GPU: the pipeline then presents its pixels
+    private volatile boolean importFailed;
 
     /**
      * Creates the DMA-BUF compositor. Builds the widget hierarchy:
@@ -168,7 +171,7 @@ final class Gtk4Compositor {
      */
     boolean publishDmaBuf(int fd, int stride, int offset, int fourcc, long modifier,
                           int width, int height, Runnable release) {
-        if (disposed || width <= 0 || height <= 0) {
+        if (disposed || importFailed || width <= 0 || height <= 0) {
             return false;
         }
         int dup = dupFd(fd);
@@ -199,7 +202,9 @@ final class Gtk4Compositor {
         }
         GdkTexture texture = importFrame(frame);
         if (texture == null) {
-            Gtk4Log.log(COMPOSITOR, "showExternalFrame: cannot import the dma-buf");
+            System.err.println("Glass GTK 4: GTK cannot import the frames of the pipeline as dma-bufs;"
+                    + " their pixels are uploaded instead");
+            importFailed = true;
             return;
         }
         picture.setPaintable(texture);

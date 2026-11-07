@@ -1451,7 +1451,8 @@ final class GLDevice {
         bindTarget();
         useProgram(program);
         setBlend(COMP_SRCOVER);
-        setDrawState(false, cull, wireframe);
+        // Meshes are clipped as the quads are, as in the other pipelines
+        setDrawState(true, cull, wireframe);
         GL.glBindBuffer(GL_UNIFORM_BUFFER, uniformBuffer);
         GL.glBufferData(GL_UNIFORM_BUFFER, uniforms.length * 4L, MemorySegment.ofArray(uniforms), GL_STREAM_DRAW);
         GL.glBindBufferBase(GL_UNIFORM_BUFFER, UNIFORM_BINDING, uniformBuffer);

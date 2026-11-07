@@ -1953,6 +1953,11 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
                 && compositor.publishDmaBuf(fd, stride, offset, fourcc, modifier, width, height, release);
     }
 
+    @Override
+    public void requestRepaint() {
+        Application.invokeLater(() -> getCurrentView().ifPresent(Gtk4View::repaint));
+    }
+
     /**
      * Handles a button press for an extended window: double-clicking the drag
      * area toggles maximization, pressing on the border starts a resize, pressing

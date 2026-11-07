@@ -67,6 +67,7 @@ final class VKDevice {
     private static final int MAX_QUADS = 16383;
     private static final long RING_SIZE = 16L * 1024 * 1024;
     private static final int FRAMES = 2;
+    private static final long MAX_KEPT_STAGING = 64L * 1024 * 1024;
 
     static final int COMP_CLEAR = 0;
     static final int COMP_SRC = 1;
@@ -99,6 +100,7 @@ final class VKDevice {
 
     private static final MethodHandle CLOSE;
     private static final MethodHandle IOCTL;
+    private static final MethodHandle POLL;
 
     static {
         Linker linker = Linker.nativeLinker();
@@ -107,6 +109,8 @@ final class VKDevice {
                 FunctionDescriptor.of(JAVA_INT, JAVA_INT));
         IOCTL = linker.downcallHandle(libc.find("ioctl").orElseThrow(),
                 FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS), Linker.Option.firstVariadicArg(2));
+        POLL = linker.downcallHandle(libc.find("poll").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT));
     }
 
     private static boolean verbose;
@@ -127,6 +131,8 @@ final class VKDevice {
     private boolean foreignQueueSupported;
     private boolean syncFileSupported;
     private boolean fillModeNonSolid;
+    // More than one GPU, as in laptops with an integrated and a discrete one
+    private boolean multipleGpus;
     private int depthFormat = VK_FORMAT_UNDEFINED;
     private int msaaSamples = 1;
 
@@ -372,12 +378,17 @@ final class VKDevice {
     private int bestDevice(MemorySegment devices, int n, String requested) {
         int best = -1;
         int bestScore = -1;
+        int gpus = 0;
         MemorySegment props = VkPhysicalDeviceProperties.allocate(scratch);
         for (int i = 0; i < n; i++) {
             vkGetPhysicalDeviceProperties(devices.getAtIndex(JAVA_LONG, i), props);
             String name = VkPhysicalDeviceProperties.deviceName(props).getString(0);
             int score = deviceScore(props);
             log("device %d: %s (score %d)", i, name, score);
+            if (score > 0) {
+                gpus++;
+                multipleGpus = gpus > 1;
+            }
             if (requested != null && name.contains(requested) && score >= 0) {
                 return i;
             }
@@ -876,28 +887,47 @@ final class VKDevice {
     }
 
     /**
-     * Allocates from the staging buffer of a frame, which only grows; a buffer
-     * that is too small is released once the frame has executed.
+     * Replaces the staging buffer of a frame with one of a size. The new one
+     * is created first, so that the frame keeps a valid buffer when that
+     * fails; the old one is released once the frame has executed.
      */
-    private long stagingAlloc(Frame frame, long size) {
-        long offset = (frame.stagingOffset + 15) & -16L;
-        if (offset + size > frame.stagingSize) {
-            if (frame.stagingBuffer != 0L) {
-                long buffer = frame.stagingBuffer;
-                long memory = frame.stagingMemory;
-                deferRelease(() -> destroyBuffer(buffer, memory));
-            }
-            long newSize = Math.max(size, frame.stagingSize * 2);
-            long[] staging = createBuffer(newSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            frame.stagingBuffer = staging[0];
-            frame.stagingMemory = staging[1];
-            frame.stagingMapped = map(staging[1], newSize);
-            frame.stagingSize = newSize;
-            offset = 0;
+    private void replaceStaging(Frame frame, long size) {
+        long[] staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        MemorySegment mapped;
+        try {
+            mapped = map(staging[1], size);
+        } catch (VKException e) {
+            destroyBuffer(staging[0], staging[1]);
+            throw e;
         }
-        frame.stagingOffset = offset + size;
-        return offset;
+        if (frame.stagingBuffer != 0L) {
+            long buffer = frame.stagingBuffer;
+            long memory = frame.stagingMemory;
+            deferRelease(() -> destroyBuffer(buffer, memory));
+        }
+        frame.stagingBuffer = staging[0];
+        frame.stagingMemory = staging[1];
+        frame.stagingMapped = mapped;
+        frame.stagingSize = size;
+        frame.stagingOffset = 0;
+    }
+
+    /**
+     * Releases the staging buffer of a frame that has executed when it is
+     * larger than a few frames of a 4K video, as it grew for exceptional
+     * uploads.
+     */
+    private void trimStaging(Frame frame) {
+        if (frame.stagingSize <= MAX_KEPT_STAGING) {
+            return;
+        }
+        destroyBuffer(frame.stagingBuffer, frame.stagingMemory);
+        frame.stagingBuffer = 0L;
+        frame.stagingMemory = 0L;
+        frame.stagingMapped = null;
+        frame.stagingSize = 0;
+        frame.stagingOffset = 0;
     }
 
     /**
@@ -949,6 +979,7 @@ final class VKDevice {
                 r.run();
             }
         }
+        trimStaging(frame);
     }
 
     /**
@@ -1179,6 +1210,17 @@ final class VKDevice {
     // ---------------------------------------------------------------------
     // Rendering
 
+    /**
+     * Prepares the recording of a transfer command: outside rendering, in a
+     * command buffer that is recording, whether or not a layout transition
+     * did it already (an image may be in the layout of the transfer already,
+     * and a staging allocation may have submitted the frame).
+     */
+    private void beginTransfer() {
+        endRendering();
+        ensureRecording();
+    }
+
     private void endRendering() {
         if (rendering) {
             vkCmdEndRendering(cmd);
@@ -1289,7 +1331,7 @@ final class VKDevice {
         }
     }
 
-    /** A barrier on an attachment that keeps its layout. */
+    /** A barrier on an image that keeps its layout. */
     private static void attachmentBarrier(MemorySegment barrier, long image, int layout, int aspect,
                                           int srcAccess, int dstAccess) {
         VkImageMemoryBarrier.srcAccessMask(barrier, srcAccess);
@@ -1604,6 +1646,7 @@ final class VKDevice {
         try {
             boolean sameSize = Math.abs(sx1 - sx0) == Math.abs(dx1 - dx0)
                     && Math.abs(sy1 - sy0) == Math.abs(dy1 - dy0);
+            beginTransfer();
             vkCmdBlitImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                     blitRegion(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1),
@@ -1669,6 +1712,7 @@ final class VKDevice {
             VkExtent3D.width(extent, Math.min(w, Math.min(src.width, dst.width) - x));
             VkExtent3D.height(extent, Math.min(h, Math.min(src.height, dst.height) - y));
             VkExtent3D.depth(extent, 1);
+            beginTransfer();
             vkCmdResolveImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, region);
         } finally {
@@ -1687,6 +1731,7 @@ final class VKDevice {
         if (src == null || dst == null) {
             return;
         }
+        awaitReaders(dst);
         transition(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         transition(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         copyImage(src, dst, Math.min(Math.min(width, src.width), dst.width),
@@ -1709,6 +1754,7 @@ final class VKDevice {
             subresourceLayers(VkImageCopy.srcSubresource(region));
             subresourceLayers(VkImageCopy.dstSubresource(region));
             extent3D(VkImageCopy.extent(region), width, height);
+            beginTransfer();
             vkCmdCopyImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, region);
         } finally {
@@ -1794,6 +1840,35 @@ final class VKDevice {
             return (int) IOCTL.invokeExact(dmabufFd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, request) == 0;
         } catch (Throwable t) {
             return false;
+        } finally {
+            scratch.reset(mark);
+        }
+    }
+
+    private static final short POLLOUT = 4;
+    private static final int READERS_TIMEOUT_MS = 100;
+
+    /**
+     * Waits for the compositor to finish reading an exported image, which
+     * GTK may give back while the GPU still reads it: the fences of its
+     * reads stay on the dma-buf, which a write waits for through poll, as
+     * Vulkan does not wait for them.
+     */
+    private void awaitReaders(VKImage exported) {
+        if (exported.fd < 0) {
+            return;
+        }
+        long mark = scratch.mark();
+        try {
+            MemorySegment pollfd = scratch.allocate(8, 4);
+            pollfd.set(JAVA_INT, 0, exported.fd);
+            pollfd.set(ValueLayout.JAVA_SHORT, 4, POLLOUT);
+            int ready = (int) POLL.invokeExact(pollfd, 1L, READERS_TIMEOUT_MS);
+            if (ready == 0) {
+                log("the compositor still reads an exported image after %d ms", READERS_TIMEOUT_MS);
+            }
+        } catch (Throwable t) {
+            log("cannot wait for the readers of an exported image: %s", t);
         } finally {
             scratch.reset(mark);
         }
@@ -1904,7 +1979,7 @@ final class VKDevice {
         MemorySegment req = VkMemoryRequirements.allocate(scratch);
         vkGetImageMemoryRequirements(device, image, req);
         int bits = VkMemoryRequirements.memoryTypeBits(req);
-        int type = findMemoryType(bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        int type = findMemoryType(bits, preferredMemory(exportable));
         if (type < 0) {
             type = findMemoryType(bits, 0);
         }
@@ -1928,6 +2003,16 @@ final class VKDevice {
         long memory = handle(p);
         vkBindImageMemory(device, image, memory, 0);
         return memory;
+    }
+
+    /**
+     * The memory to prefer for an image: that of the device, except for the
+     * exported images of a system with more than one GPU, which go in system
+     * memory, as the GPU of the compositor may be another one, which cannot
+     * import the memory of this one.
+     */
+    private int preferredMemory(boolean exportable) {
+        return exportable && multipleGpus ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     }
 
     /**
@@ -2055,9 +2140,14 @@ final class VKDevice {
         Staging staging = stage((long) rowBytes * height);
         long srcBase = (long) srcy * stride + (long) srcx * img.bytesPerPixel;
         copyRows(src, srcBase, stride, staging.mapped(), rowBytes, height);
+        boolean rewrite = img.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && !img.foreign;
         transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         long mark = scratch.mark();
         try {
+            beginTransfer();
+            if (rewrite) {
+                transferWriteBarrier(img);
+            }
             vkCmdCopyBufferToImage(cmd, staging.buffer(), img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                     bufferImageRegion(staging.offset(), dstx, dsty, width, height));
             statUploads++;
@@ -2065,6 +2155,18 @@ final class VKDevice {
         } finally {
             scratch.reset(mark);
         }
+    }
+
+    /**
+     * Orders a copy into an image after the previous copy into it, which left
+     * it in the same layout, so with no layout transition between them.
+     */
+    private void transferWriteBarrier(VKImage img) {
+        MemorySegment barrier = VkImageMemoryBarrier.allocate(scratch);
+        attachmentBarrier(barrier, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                0, MemorySegment.NULL, 0, MemorySegment.NULL, 1, barrier);
     }
 
     /** Host memory for an upload, in a buffer at an offset. */
@@ -2075,18 +2177,43 @@ final class VKDevice {
      * its half is full, or in the staging buffer of the frame when larger.
      */
     private Staging stage(long size) {
-        boolean fitsRing = size <= RING_SIZE / FRAMES;
-        long offset = fitsRing ? ringAlloc(size, 16) : -1;
-        if (offset < 0 && fitsRing) {
+        if (size > RING_SIZE / FRAMES) {
+            return stageLarge(size);
+        }
+        long offset = ringAlloc(size, 16);
+        if (offset < 0) {
             submit(0L);
             offset = ringAlloc(size, 16);
         }
-        if (offset >= 0) {
-            return new Staging(ringBuffer, offset, ringMapped.asSlice(offset, size));
-        }
+        return new Staging(ringBuffer, offset, ringMapped.asSlice(offset, size));
+    }
+
+    /**
+     * An upload larger than the ring, in the staging buffer of the frame:
+     * after submitting the frame when its staging buffer is in use and too
+     * small, and in a buffer of the size of the upload when it is still too
+     * small, as the ring is used.
+     */
+    private Staging stageLarge(long size) {
         Frame frame = frames[frameIndex];
-        offset = stagingAlloc(frame, size);
+        if (!fitsStaging(frame, size) && frame.stagingOffset > 0) {
+            submit(0L);
+            frame = frames[frameIndex];
+        }
+        if (!fitsStaging(frame, size)) {
+            replaceStaging(frame, size);
+        }
+        long offset = alignStaging(frame.stagingOffset);
+        frame.stagingOffset = offset + size;
         return new Staging(frame.stagingBuffer, offset, frame.stagingMapped.asSlice(offset, size));
+    }
+
+    private static long alignStaging(long offset) {
+        return (offset + 15) & -16L;
+    }
+
+    private static boolean fitsStaging(Frame frame, long size) {
+        return alignStaging(frame.stagingOffset) + size <= frame.stagingSize;
     }
 
     /** Copies rows that are stride bytes apart into packed rows. */
@@ -2127,6 +2254,7 @@ final class VKDevice {
                     ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : img.layout;
             transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             copyToBuffer(img, host[0], x, y, width, height);
+            hostReadBarrier(host[0]);
             transition(img, previous);
             flush();
             MemorySegment.copy(mapped, 0, dst, 0, size);
@@ -2135,6 +2263,27 @@ final class VKDevice {
             return false;
         } finally {
             destroyBuffer(host[0], host[1]);
+        }
+    }
+
+    /**
+     * Makes the writes of the GPU into a buffer visible to the host: the
+     * fence that flush() waits for does not.
+     */
+    private void hostReadBarrier(long buffer) {
+        long mark = scratch.mark();
+        try {
+            MemorySegment barrier = VkBufferMemoryBarrier.allocate(scratch);
+            VkBufferMemoryBarrier.srcAccessMask(barrier, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkBufferMemoryBarrier.dstAccessMask(barrier, VK_ACCESS_HOST_READ_BIT);
+            VkBufferMemoryBarrier.srcQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_IGNORED);
+            VkBufferMemoryBarrier.dstQueueFamilyIndex(barrier, VK_QUEUE_FAMILY_IGNORED);
+            VkBufferMemoryBarrier.buffer(barrier, buffer);
+            VkBufferMemoryBarrier.size(barrier, VK_WHOLE_SIZE);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                    0, MemorySegment.NULL, 1, barrier, 0, MemorySegment.NULL);
+        } finally {
+            scratch.reset(mark);
         }
     }
 
@@ -2153,6 +2302,7 @@ final class VKDevice {
     private void copyToBuffer(VKImage img, long buffer, int x, int y, int width, int height) {
         long mark = scratch.mark();
         try {
+            beginTransfer();
             vkCmdCopyImageToBuffer(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
                     bufferImageRegion(0, x, y, width, height));
         } finally {
@@ -2490,6 +2640,7 @@ final class VKDevice {
                 }
                 MemorySegment range = VkImageSubresourceRange.allocate(scratch);
                 subresourceRange(range, VK_IMAGE_ASPECT_COLOR_BIT);
+                beginTransfer();
                 vkCmdClearColorImage(cmd, dummyTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, color, 1, range);
             } finally {
                 scratch.reset(mark);
@@ -2571,8 +2722,8 @@ final class VKDevice {
         try {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             pushDescriptors(uniformOffset, uniformBytes, images, imageSamplers);
-            // Meshes are not clipped
-            setDrawState(false, cull);
+            // Meshes are clipped as the quads are, as in the other pipelines
+            setDrawState(true, cull);
             vkCmdBindVertexBuffers(cmd, 0, 1, scratch.allocateFrom(JAVA_LONG, mesh.vertexBuffer),
                     scratch.allocateFrom(JAVA_LONG, 0L));
             vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, mesh.indexType);

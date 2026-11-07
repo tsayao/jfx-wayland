@@ -343,7 +343,7 @@ tasks.register('generateVulkanBindings', com.sun.javafx.gradle.VulkanBindingsGen
         "VkClearAttachment", "VkClearRect", "VkClearValue", "VkImageMemoryBarrier",
         "VkImageBlit", "VkImageResolve", "VkImageCopy", "VkBufferImageCopy",
         "VkDescriptorBufferInfo", "VkDescriptorImageInfo", "VkWriteDescriptorSet",
-        "VkImageSubresourceRange",
+        "VkImageSubresourceRange", "VkBufferMemoryBarrier",
     ]
     outputDir = new File(bindingsDir, 'vk')
     // Only generated sources are there: a type removed from the lists goes away
