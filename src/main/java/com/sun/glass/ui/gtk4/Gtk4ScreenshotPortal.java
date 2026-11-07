@@ -21,33 +21,21 @@
 package com.sun.glass.ui.gtk4;
 
 import com.sun.glass.ui.gtk4.wrappers.GBytes;
-import com.sun.glass.ui.gtk4.wrappers.GDBusConnection;
-import com.sun.glass.ui.gtk4.wrappers.GMainContext;
 import com.sun.glass.ui.gtk4.wrappers.GVariant;
 import com.sun.glass.ui.gtk4.wrappers.GVariantType;
 import com.sun.glass.ui.gtk4.wrappers.Gdk;
 import com.sun.glass.ui.gtk4.wrappers.GdkTexture;
 import com.sun.glass.ui.gtk4.wrappers.GdkTextureDownloader;
-import com.sun.glass.ui.gtk4.wrappers.Gio;
 import javafx.scene.paint.Color;
 
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import static com.sun.glass.ui.gtk4.Gtk4RemoteDesktopPortal.PORTAL;
-import static com.sun.glass.ui.gtk4.Gtk4RemoteDesktopPortal.PORTAL_PATH;
-import static com.sun.glass.ui.gtk4.Gtk4RemoteDesktopPortal.REQUEST;
-import static com.sun.glass.ui.gtk4.Gtk4RemoteDesktopPortal.RESPONSE_CALLBACK;
+import java.util.function.LongConsumer;
 
 /**
  * What the compositor shows on the screens, through the Screenshot interface
@@ -68,7 +56,6 @@ final class Gtk4ScreenshotPortal {
     private static final Gtk4Log.Category LOG = Gtk4Log.Category.FOCUS;
 
     private static final String SCREENSHOT = "org.freedesktop.portal.Screenshot";
-    private static final int RESPONSE_SUCCESS = 0;
 
     // The clicks of PickColor: the first one, and then one every while, until
     // the picker answers
@@ -77,8 +64,6 @@ final class Gtk4ScreenshotPortal {
     private static final int PICK_CLICKS = 8;
     // The desktop may ask the user to allow the screenshot
     private static final long SCREENSHOT_TIMEOUT_MS = 60_000;
-
-    private static final AtomicInteger tokens = new AtomicInteger();
 
     // The version of the interface: -1 until it is asked, 0 when there is none
     private static int version = -1;
@@ -271,154 +256,37 @@ final class Gtk4ScreenshotPortal {
         return value == null || value.isNull() ? null : value;
     }
 
-    // What a request does while it waits, with the milliseconds since the call
-    private interface Waiting {
-        void tick(long elapsedMs);
-    }
-
     /**
      * Calls a method of the Screenshot interface, whose arguments are the
-     * parent window and the options, and runs the main context of the robot
-     * thread until the request answers or the time is over, when the request
-     * is closed.
+     * parent window and the options, and waits for its answer on the thread
+     * of the robot.
      *
      * @return the results of the answer, or null when the portal refused, failed or did not answer
      */
-    private static GVariant request(String method, GVariant[] options, long timeoutMs, Waiting waiting) {
-        GDBusConnection bus = Gtk4RemoteDesktopPortal.bus();
-        String token = "jfx_shot_" + ProcessHandle.current().pid() + "_" + tokens.incrementAndGet();
-        String expected = requestPath(bus, token);
-        try (Arena arena = Arena.ofConfined()) {
-            var waiter = new Waiter();
-            MemorySegment callback = waiter.callback(arena);
-            int subscription = subscribe(bus, expected, callback);
-            String path = expected;
-            try {
-                path = call(bus, method, withToken(options, token));
-                if (!expected.equals(path)) {
-                    bus.signalUnsubscribe(subscription);
-                    subscription = subscribe(bus, path, callback);
-                }
-                if (!waiter.await(timeoutMs, waiting)) {
-                    Gtk4Log.log(LOG, "the screenshot portal did not answer %s", method);
-                    close(bus, path);
-                    return null;
-                }
-            } catch (RuntimeException e) {
-                Gtk4Log.log(LOG, "the screenshot portal failed %s: %s", method, e);
-                if (!waiter.done) {
-                    close(bus, path);
-                }
-                return null;
-            } finally {
-                bus.signalUnsubscribe(subscription);
-            }
-            return waiter.successfulResults(method);
-        }
-    }
-
-    /** The object path of the Request that a call with a token creates. */
-    private static String requestPath(GDBusConnection bus, String token) {
-        String sender = bus.getUniqueName().substring(1).replace('.', '_');
-        return PORTAL_PATH + "/request/" + sender + "/" + token;
-    }
-
-    private static GVariant[] withToken(GVariant[] options, String token) {
-        GVariant[] all = Arrays.copyOf(options, options.length + 1);
-        all[options.length] = Gtk4RemoteDesktopPortal.entry("handle_token", GVariant.createString(token));
-        return all;
-    }
-
-    /** Calls a method of the interface and returns the path of its Request. */
-    private static String call(GDBusConnection bus, String method, GVariant[] options) {
-        GVariant reply = bus.callSync(PORTAL, PORTAL_PATH, SCREENSHOT, method,
-                GVariant.createTuple(new GVariant[] {GVariant.createString(""),
-                    Gtk4RemoteDesktopPortal.array("{sv}", options)}),
-                null, Gio.G_DBUS_CALL_FLAGS_NONE, -1, null);
-        GVariant handle = reply.getChildValue(0);
-        String path = handle.getString(null);
-        handle.unref();
-        reply.unref();
-        return path;
-    }
-
-    /** Ends a request, and the picker of the desktop with it. */
-    private static void close(GDBusConnection bus, String path) {
+    private static GVariant request(String method, GVariant[] options, long timeoutMs, LongConsumer tick) {
+        var request = new Gtk4PortalRequest("jfx_shot");
         try {
-            bus.callSync(PORTAL, path, REQUEST, "Close", GVariant.createTuple(new GVariant[0]), null,
-                    Gio.G_DBUS_CALL_FLAGS_NONE, -1, null).unref();
+            GVariant[] all = Arrays.copyOf(options, options.length + 1);
+            all[options.length] = request.tokenOption();
+            request.call(SCREENSHOT, method, GVariant.createTuple(new GVariant[] {
+                GVariant.createString(""), Gtk4RemoteDesktopPortal.array("{sv}", all)}));
+            Gtk4PortalRequest.Response response = request.awaitIterating(timeoutMs, tick);
+            if (response == null) {
+                Gtk4Log.log(LOG, "the screenshot portal did not answer %s", method);
+                return null;
+            }
+            if (!response.succeeded()) {
+                Gtk4Log.log(LOG, "the screenshot portal refused %s (response %d)", method, response.code());
+            }
+            return response.successfulResults();
         } catch (RuntimeException e) {
-            Gtk4Log.log(LOG, "cannot close the screenshot portal request: %s", e);
-        }
-    }
-
-    private static int subscribe(GDBusConnection bus, String path, MemorySegment callback) {
-        return bus.signalSubscribe(PORTAL, REQUEST, "Response", path, null,
-                Gio.G_DBUS_SIGNAL_FLAGS_NO_MATCH_RULE, callback, null, null);
-    }
-
-    /** Waits for the Response signal of a Request. */
-    private static final class Waiter {
-        private int code = -1;
-        private GVariant results;
-        private boolean done;
-
-        MemorySegment callback(Arena arena) {
-            try {
-                return Gtk4SignalHelper.upcall(MethodHandles.lookup(),
-                        MethodHandles.lookup().bind(this, "response", MethodType.methodType(void.class,
-                                MemorySegment.class, MemorySegment.class, MemorySegment.class, MemorySegment.class,
-                                MemorySegment.class, GVariant.class, MemorySegment.class)),
-                        RESPONSE_CALLBACK, arena);
-            } catch (NoSuchMethodException | IllegalAccessException e) {
-                throw new IllegalStateException(e);
-            }
-        }
-
-        /**
-         * Iterates the main context of the robot thread until the response
-         * arrives, or the time is over.
-         *
-         * @return whether the response arrived
-         */
-        boolean await(long timeoutMs, Waiting waiting) {
-            GMainContext context = Gtk4RobotThread.context();
-            long called = System.nanoTime();
-            long deadline = called + timeoutMs * 1_000_000L;
-            while (!done && System.nanoTime() <= deadline) {
-                if (!context.iteration(false)) {
-                    Gtk4EiInput.sleep(1);
-                }
-                if (waiting != null && !done) {
-                    waiting.tick((System.nanoTime() - called) / 1_000_000L);
-                }
-            }
-            return done;
-        }
-
-        /** The results of a successful response, or null. */
-        GVariant successfulResults(String method) {
-            if (code == RESPONSE_SUCCESS) {
-                return results;
-            }
-            Gtk4Log.log(LOG, "the screenshot portal refused %s (response %d)", method, code);
-            if (results != null) {
-                results.unref();
+            Gtk4Log.log(LOG, "the screenshot portal failed %s: %s", method, e);
+            if (!request.isDone()) {
+                request.cancel();
             }
             return null;
-        }
-
-        @SuppressWarnings("unused")
-        void response(MemorySegment connection, MemorySegment sender, MemorySegment path,
-                      MemorySegment iface, MemorySegment signal, GVariant parameters, MemorySegment data) {
-            if (done) {
-                return;
-            }
-            GVariant value = parameters.getChildValue(0);
-            code = value.getUint32();
-            value.unref();
-            results = parameters.getChildValue(1);
-            done = true;
+        } finally {
+            request.close();
         }
     }
 }

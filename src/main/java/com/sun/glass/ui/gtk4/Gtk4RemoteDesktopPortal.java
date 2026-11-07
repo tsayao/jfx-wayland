@@ -21,24 +21,17 @@
 package com.sun.glass.ui.gtk4;
 
 import com.sun.glass.ui.gtk4.wrappers.GDBusConnection;
-import com.sun.glass.ui.gtk4.wrappers.GMainContext;
 import com.sun.glass.ui.gtk4.wrappers.GUnixFDList;
 import com.sun.glass.ui.gtk4.wrappers.GVariant;
 import com.sun.glass.ui.gtk4.wrappers.GVariantType;
 import com.sun.glass.ui.gtk4.wrappers.Gio;
 
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.MemorySegment;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The input of the robot in any session, through the RemoteDesktop interface
@@ -53,24 +46,15 @@ final class Gtk4RemoteDesktopPortal {
 
     private static final Gtk4Log.Category LOG = Gtk4Log.Category.FOCUS;
 
-    static final String PORTAL = "org.freedesktop.portal.Desktop";
-    static final String PORTAL_PATH = "/org/freedesktop/portal/desktop";
+    private static final String PORTAL = Gtk4PortalRequest.PORTAL;
+    private static final String PORTAL_PATH = Gtk4PortalRequest.PORTAL_PATH;
     private static final String REMOTE_DESKTOP = "org.freedesktop.portal.RemoteDesktop";
-    static final String REQUEST = "org.freedesktop.portal.Request";
 
-    private static final int RESPONSE_SUCCESS = 0;
-    private static final int RESPONSE_CANCELLED = 1;
     private static final int DEVICE_KEYBOARD = 1;
     private static final int DEVICE_POINTER = 2;
     private static final int DEVICE_TOUCHSCREEN = 4;
     // Kept until the user revokes the permission
     private static final int PERSIST_PERMANENT = 2;
-
-    static final FunctionDescriptor RESPONSE_CALLBACK = Gtk4SignalHelper.buildDescriptor(void.class,
-            MemorySegment.class, MemorySegment.class, MemorySegment.class, MemorySegment.class, MemorySegment.class,
-            GVariant.class, MemorySegment.class);
-
-    private static final AtomicInteger tokens = new AtomicInteger();
 
     private static GDBusConnection bus;
     // The session lives as long as the application: closing it ends the input
@@ -225,21 +209,24 @@ final class Gtk4RemoteDesktopPortal {
     }
 
     /**
-     * Calls a method of the portal that answers with a Request, and waits for
-     * its response, iterating the main context of the calling thread (that of
-     * the robot), where the response is subscribed.
+     * Calls a method of the RemoteDesktop interface that answers with a
+     * Request, and waits for its response, blocking in the main context of
+     * the calling thread (that of the robot).
      *
      * @param session the session handle, the first argument of the method, or null
      * @param parent the parent window, the second argument of the method, or null
      * @return the results of the response
      */
     private static GVariant request(String method, String session, String parent, GVariant... options) {
-        String token = "jfx_" + ProcessHandle.current().pid() + "_" + tokens.incrementAndGet();
-        String sender = bus.getUniqueName().substring(1).replace('.', '_');
-        String expected = PORTAL_PATH + "/request/" + sender + "/" + token;
-        List<GVariant> all = new ArrayList<>(List.of(options));
-        all.add(entry("handle_token", GVariant.createString(token)));
+        try (var request = new Gtk4PortalRequest("jfx")) {
+            List<GVariant> all = new ArrayList<>(List.of(options));
+            all.add(request.tokenOption());
+            request.call(REMOTE_DESKTOP, method, requestArguments(session, parent, all));
+            return successfulResults(method, request.awaitBlocking());
+        }
+    }
 
+    private static GVariant requestArguments(String session, String parent, List<GVariant> options) {
         List<GVariant> args = new ArrayList<>();
         if (session != null) {
             args.add(GVariant.createObjectPath(session));
@@ -247,52 +234,24 @@ final class Gtk4RemoteDesktopPortal {
         if (parent != null) {
             args.add(GVariant.createString(parent));
         }
-        args.add(array("{sv}", all.toArray(new GVariant[0])));
-
-        try (Arena arena = Arena.ofConfined()) {
-            Waiter waiter = new Waiter();
-            MemorySegment callback = Gtk4SignalHelper.upcall(MethodHandles.lookup(),
-                    MethodHandles.lookup().bind(waiter, "response", MethodType.methodType(void.class,
-                            MemorySegment.class, MemorySegment.class, MemorySegment.class, MemorySegment.class,
-                            MemorySegment.class, GVariant.class, MemorySegment.class)),
-                    RESPONSE_CALLBACK, arena);
-            int subscription = subscribe(expected, callback);
-            try {
-                GVariant reply = bus.callSync(PORTAL, PORTAL_PATH, REMOTE_DESKTOP, method,
-                        GVariant.createTuple(args.toArray(new GVariant[0])), null,
-                        Gio.G_DBUS_CALL_FLAGS_NONE, -1, null);
-                GVariant handle = reply.getChildValue(0);
-                String path = handle.getString(null);
-                handle.unref();
-                reply.unref();
-                if (!expected.equals(path)) {
-                    bus.signalUnsubscribe(subscription);
-                    subscription = subscribe(path, callback);
-                }
-                waiter.await();
-            } finally {
-                bus.signalUnsubscribe(subscription);
-            }
-            if (waiter.code != RESPONSE_SUCCESS) {
-                if (waiter.results != null) {
-                    waiter.results.unref();
-                }
-                String message = "The remote desktop portal refused " + method + " (response " + waiter.code
-                        + "): the robot needs the permission to control the desktop";
-                // The user said no: the robot does not ask again. Otherwise,
-                // as when the dialog went away, it asks on its next call
-                throw waiter.code == RESPONSE_CANCELLED
-                        ? new UnsupportedOperationException(message) : new IllegalStateException(message);
-            }
-            return waiter.results;
-        } catch (NoSuchMethodException | IllegalAccessException e) {
-            throw new IllegalStateException(e);
-        }
+        args.add(array("{sv}", options.toArray(new GVariant[0])));
+        return GVariant.createTuple(args.toArray(new GVariant[0]));
     }
 
-    private static int subscribe(String path, MemorySegment callback) {
-        return bus.signalSubscribe(PORTAL, REQUEST, "Response", path, null,
-                Gio.G_DBUS_SIGNAL_FLAGS_NO_MATCH_RULE, callback, null, null);
+    /**
+     * The results of a response; a refusal throws. The user said no: the
+     * robot does not ask again. Otherwise, as when the dialog went away, it
+     * asks on its next call.
+     */
+    private static GVariant successfulResults(String method, Gtk4PortalRequest.Response response) {
+        if (response.succeeded()) {
+            return response.results();
+        }
+        response.successfulResults();
+        String message = "The remote desktop portal refused " + method + " (response " + response.code()
+                + "): the robot needs the permission to control the desktop";
+        throw response.code() == Gtk4PortalRequest.RESPONSE_CANCELLED
+                ? new UnsupportedOperationException(message) : new IllegalStateException(message);
     }
 
     static GVariant entry(String key, GVariant value) {
@@ -305,33 +264,6 @@ final class Gtk4RemoteDesktopPortal {
             return GVariant.createArray(type, children);
         } finally {
             type.free();
-        }
-    }
-
-    private static final class Waiter {
-        private int code = -1;
-        private GVariant results;
-        private boolean done;
-
-        void await() {
-            GMainContext context = Gtk4RobotThread.context();
-            while (!done) {
-                // The user may take a while to answer the dialog of the desktop
-                context.iteration(true);
-            }
-        }
-
-        @SuppressWarnings("unused")
-        void response(MemorySegment connection, MemorySegment sender, MemorySegment path,
-                      MemorySegment iface, MemorySegment signal, GVariant parameters, MemorySegment data) {
-            if (done) {
-                return;
-            }
-            GVariant value = parameters.getChildValue(0);
-            code = value.getUint32();
-            value.unref();
-            results = parameters.getChildValue(1);
-            done = true;
         }
     }
 }
