@@ -204,29 +204,8 @@ final class Gtk4Accessible extends Accessible {
             return;
         }
         switch (notification) {
-            case FOCUS_NODE -> {
-                Node node = (Node) getAttribute(FOCUS_NODE);
-                if (node == null && getView() == null) {
-                    Scene scene = (Scene) getAttribute(SCENE);
-                    if (getAccessible(scene) instanceof Gtk4Accessible acc && acc != this) {
-                        acc.sendNotification(FOCUS_NODE);
-                    }
-                    return;
-                }
-                focusNode = node;
-                setFocusOwner(focusTarget(node));
-            }
-            case FOCUS_ITEM -> {
-                Node item = (Node) getAttribute(FOCUS_ITEM);
-                if (focusOwner == this || (focusOwner != null && isAncestorOf(focusOwner))) {
-                    Gtk4Accessible acc = item != null ? accessibleOf(item) : null;
-                    setFocusOwner(acc != null ? acc : this);
-                } else {
-                    // The list of a combo box notifies its focused item, which the combo box,
-                    // which has the focus, reports as its own while its popup shows
-                    refocus();
-                }
-            }
+            case FOCUS_NODE -> focusNodeChanged();
+            case FOCUS_ITEM -> focusItemChanged();
             case EXPANDED -> {
                 pushAll();
                 refocus();
@@ -238,6 +217,35 @@ final class Gtk4Accessible extends Accessible {
             case CARET_OFFSET -> caretChanged();
             case SELECTION_START, SELECTION_END -> selectionChanged();
             default -> pushAll();
+        }
+    }
+
+    /** The focus moved to another node; a node out of a view forwards it to its scene. */
+    private void focusNodeChanged() {
+        Node node = (Node) getAttribute(FOCUS_NODE);
+        if (node == null && getView() == null) {
+            Scene scene = (Scene) getAttribute(SCENE);
+            if (getAccessible(scene) instanceof Gtk4Accessible acc && acc != this) {
+                acc.sendNotification(FOCUS_NODE);
+            }
+            return;
+        }
+        focusNode = node;
+        setFocusOwner(focusTarget(node));
+    }
+
+    /**
+     * The focused item of a control changed. The list of a combo box
+     * notifies its focused item, which the combo box, which has the focus,
+     * reports as its own while its popup shows.
+     */
+    private void focusItemChanged() {
+        if (focusOwner == this || (focusOwner != null && isAncestorOf(focusOwner))) {
+            Node item = (Node) getAttribute(FOCUS_ITEM);
+            Gtk4Accessible acc = item != null ? accessibleOf(item) : null;
+            setFocusOwner(acc != null ? acc : this);
+        } else {
+            refocus();
         }
     }
 
@@ -308,22 +316,12 @@ final class Gtk4Accessible extends Accessible {
         if (!acc.isSceneAccessible() && isLeafRole(role)) {
             return;
         }
-        Object children = acc.getAttribute(CHILDREN);
-        if (!(children instanceof List<?> list)) {
+        if (!(acc.getAttribute(CHILDREN) instanceof List<?> list)) {
             return;
         }
-        int itemCount = switch (role) {
-            case LIST_VIEW -> acc.getAttribute(ITEM_COUNT) instanceof Integer c ? c : -1;
-            case TABLE_VIEW -> acc.getAttribute(ROW_COUNT) instanceof Integer c ? c : -1;
-            case TREE_VIEW, TREE_TABLE_VIEW -> acc.getAttribute(TREE_ITEM_COUNT) instanceof Integer c ? c
-                    : acc.getAttribute(ROW_COUNT) instanceof Integer c2 ? c2 : -1;
-            default -> inheritedCount;
-        };
+        int itemCount = itemCount(acc, role, inheritedCount);
         for (Object o : list) {
-            if (!(o instanceof Node node)) {
-                continue;
-            }
-            Gtk4Accessible child = acc.accessibleOf(node);
+            Gtk4Accessible child = o instanceof Node node ? acc.accessibleOf(node) : null;
             if (child == null || !child.isShown()) {
                 continue;
             }
@@ -333,6 +331,20 @@ final class Gtk4Accessible extends Accessible {
                 result.add(child);
             }
         }
+    }
+
+    /**
+     * The number of items of a list, table or tree, whose cells beyond it
+     * are left out, or the count of the parent for the nodes in between.
+     */
+    private static int itemCount(Gtk4Accessible acc, AccessibleRole role, int inheritedCount) {
+        return switch (role) {
+            case LIST_VIEW -> acc.getAttribute(ITEM_COUNT) instanceof Integer c ? c : -1;
+            case TABLE_VIEW -> acc.getAttribute(ROW_COUNT) instanceof Integer c ? c : -1;
+            case TREE_VIEW, TREE_TABLE_VIEW -> acc.getAttribute(TREE_ITEM_COUNT) instanceof Integer c ? c
+                    : acc.getAttribute(ROW_COUNT) instanceof Integer c2 ? c2 : -1;
+            default -> inheritedCount;
+        };
     }
 
     private boolean isItemWithin(int itemCount) {
@@ -601,46 +613,36 @@ final class Gtk4Accessible extends Accessible {
         pushString(n, Gtk.ACCESSIBLE_PROPERTY_LABEL, accessibleName(role));
         pushString(n, Gtk.ACCESSIBLE_PROPERTY_DESCRIPTION, (String) getAttribute(HELP));
         pushString(n, Gtk.ACCESSIBLE_PROPERTY_ROLE_DESCRIPTION, (String) getAttribute(ROLE_DESCRIPTION));
-        pushState(n, Gtk.ACCESSIBLE_STATE_DISABLED, Boolean.TRUE.equals(getAttribute(DISABLED)) ? 1 : 0);
+        pushState(n, Gtk.ACCESSIBLE_STATE_DISABLED, isTrue(DISABLED) ? 1 : 0);
+        pushRoleStates(n, role);
+        pushExpanded(n, role);
+        if (role == AccessibleRole.TREE_ITEM || role == AccessibleRole.CHECK_BOX_TREE_ITEM) {
+            Object level = getAttribute(DISCLOSURE_LEVEL);
+            if (level instanceof Integer l) {
+                pushInt(n, Gtk.ACCESSIBLE_PROPERTY_LEVEL, l + 1);
+            }
+        }
+    }
 
+    private boolean isTrue(AccessibleAttribute attribute) {
+        return Boolean.TRUE.equals(getAttribute(attribute));
+    }
+
+    private static int tristate(boolean value) {
+        return value ? Gtk.ACCESSIBLE_TRISTATE_TRUE : Gtk.ACCESSIBLE_TRISTATE_FALSE;
+    }
+
+    /** The states and properties that depend on the role: checked, pressed, selected, range, text. */
+    private void pushRoleStates(Native n, AccessibleRole role) {
         switch (role) {
-            case CHECK_BOX, CHECK_BOX_TREE_ITEM -> {
-                Object toggle = getAttribute(TOGGLE_STATE);
-                boolean mixed = toggle != null ? toggle == ToggleState.INDETERMINATE
-                        : Boolean.TRUE.equals(getAttribute(INDETERMINATE));
-                boolean checked = toggle != null ? toggle == ToggleState.CHECKED
-                        : Boolean.TRUE.equals(getAttribute(SELECTED));
-                int value = mixed ? Gtk.ACCESSIBLE_TRISTATE_MIXED
-                        : checked ? Gtk.ACCESSIBLE_TRISTATE_TRUE : Gtk.ACCESSIBLE_TRISTATE_FALSE;
-                pushState(n, Gtk.ACCESSIBLE_STATE_CHECKED, value);
-            }
-            case RADIO_BUTTON, CHECK_MENU_ITEM, RADIO_MENU_ITEM -> pushState(n, Gtk.ACCESSIBLE_STATE_CHECKED,
-                    Boolean.TRUE.equals(getAttribute(SELECTED)) ? Gtk.ACCESSIBLE_TRISTATE_TRUE
-                            : Gtk.ACCESSIBLE_TRISTATE_FALSE);
-            case TOGGLE_BUTTON -> pushState(n, Gtk.ACCESSIBLE_STATE_PRESSED,
-                    Boolean.TRUE.equals(getAttribute(SELECTED)) ? Gtk.ACCESSIBLE_TRISTATE_TRUE
-                            : Gtk.ACCESSIBLE_TRISTATE_FALSE);
+            case CHECK_BOX, CHECK_BOX_TREE_ITEM -> pushState(n, Gtk.ACCESSIBLE_STATE_CHECKED, checkBoxState());
+            case RADIO_BUTTON, CHECK_MENU_ITEM, RADIO_MENU_ITEM ->
+                pushState(n, Gtk.ACCESSIBLE_STATE_CHECKED, tristate(isTrue(SELECTED)));
+            case TOGGLE_BUTTON -> pushState(n, Gtk.ACCESSIBLE_STATE_PRESSED, tristate(isTrue(SELECTED)));
             case LIST_ITEM, TAB_ITEM, TABLE_ROW, TABLE_CELL, TREE_ITEM, TREE_TABLE_ROW, TREE_TABLE_CELL,
-                 PAGE_ITEM -> pushState(n, Gtk.ACCESSIBLE_STATE_SELECTED,
-                    Boolean.TRUE.equals(getAttribute(SELECTED)) ? 1 : 0);
-            case SLIDER, SCROLL_BAR, PROGRESS_INDICATOR -> {
-                pushRange(n);
-                Object orientation = getAttribute(ORIENTATION);
-                if (orientation instanceof Orientation o) {
-                    pushInt(n, Gtk.ACCESSIBLE_PROPERTY_ORIENTATION, o == Orientation.HORIZONTAL
-                            ? Gtk.ORIENTATION_HORIZONTAL : Gtk.ORIENTATION_VERTICAL);
-                }
-                if (role == AccessibleRole.PROGRESS_INDICATOR) {
-                    pushState(n, Gtk.ACCESSIBLE_STATE_BUSY, Boolean.TRUE.equals(getAttribute(INDETERMINATE)) ? 1 : 0);
-                }
-            }
-            case SPINNER -> {
-                String value = (String) getAttribute(VALUE_STRING);
-                pushString(n, Gtk.ACCESSIBLE_PROPERTY_VALUE_TEXT, value);
-                // AT-SPI tells the change of a value by its number: a text that is not a
-                // number gets one that changes with it
-                pushDouble(n, Gtk.ACCESSIBLE_PROPERTY_VALUE_NOW, spinnerNumber(value));
-            }
+                 PAGE_ITEM -> pushState(n, Gtk.ACCESSIBLE_STATE_SELECTED, isTrue(SELECTED) ? 1 : 0);
+            case SLIDER, SCROLL_BAR, PROGRESS_INDICATOR -> pushRangeState(n, role);
+            case SPINNER -> pushSpinnerValue(n);
             case TEXT_FIELD, TEXT_AREA, PASSWORD_FIELD -> {
                 pushInt(n, Gtk.ACCESSIBLE_PROPERTY_READ_ONLY, Boolean.FALSE.equals(getAttribute(EDITABLE)) ? 1 : 0);
                 pushInt(n, Gtk.ACCESSIBLE_PROPERTY_MULTI_LINE, role == AccessibleRole.TEXT_AREA ? 1 : 0);
@@ -648,24 +650,47 @@ final class Gtk4Accessible extends Accessible {
             default -> {
             }
         }
+    }
 
+    /** Checked, unchecked or mixed, from the toggle state, or else from the selection. */
+    private int checkBoxState() {
+        Object toggle = getAttribute(TOGGLE_STATE);
+        boolean mixed = toggle != null ? toggle == ToggleState.INDETERMINATE : isTrue(INDETERMINATE);
+        boolean checked = toggle != null ? toggle == ToggleState.CHECKED : isTrue(SELECTED);
+        return mixed ? Gtk.ACCESSIBLE_TRISTATE_MIXED : tristate(checked);
+    }
+
+    /** The range, the orientation and, for a progress indicator, whether it is busy. */
+    private void pushRangeState(Native n, AccessibleRole role) {
+        pushRange(n);
+        if (getAttribute(ORIENTATION) instanceof Orientation o) {
+            pushInt(n, Gtk.ACCESSIBLE_PROPERTY_ORIENTATION, o == Orientation.HORIZONTAL
+                    ? Gtk.ORIENTATION_HORIZONTAL : Gtk.ORIENTATION_VERTICAL);
+        }
+        if (role == AccessibleRole.PROGRESS_INDICATOR) {
+            pushState(n, Gtk.ACCESSIBLE_STATE_BUSY, isTrue(INDETERMINATE) ? 1 : 0);
+        }
+    }
+
+    private void pushSpinnerValue(Native n) {
+        String value = (String) getAttribute(VALUE_STRING);
+        pushString(n, Gtk.ACCESSIBLE_PROPERTY_VALUE_TEXT, value);
+        // AT-SPI tells the change of a value by its number: a text that is not a
+        // number gets one that changes with it
+        pushDouble(n, Gtk.ACCESSIBLE_PROPERTY_VALUE_NOW, spinnerNumber(value));
+    }
+
+    /** Whether a node that can expand is expanded; tree leaves cannot. */
+    private void pushExpanded(Native n, AccessibleRole role) {
         switch (role) {
             case TREE_ITEM, CHECK_BOX_TREE_ITEM, TITLED_PANE, COMBO_BOX, DATE_PICKER, MENU_BUTTON,
                  SPLIT_MENU_BUTTON, TREE_TABLE_ROW -> {
-                Object expanded = getAttribute(EXPANDED);
-                if (expanded instanceof Boolean b && !(role.name().startsWith("TREE")
-                        && Boolean.TRUE.equals(getAttribute(LEAF)))) {
+                boolean leaf = role.name().startsWith("TREE") && isTrue(LEAF);
+                if (getAttribute(EXPANDED) instanceof Boolean b && !leaf) {
                     pushState(n, Gtk.ACCESSIBLE_STATE_EXPANDED, b ? 1 : 0);
                 }
             }
             default -> {
-            }
-        }
-
-        if (role == AccessibleRole.TREE_ITEM || role == AccessibleRole.CHECK_BOX_TREE_ITEM) {
-            Object level = getAttribute(DISCLOSURE_LEVEL);
-            if (level instanceof Integer l) {
-                pushInt(n, Gtk.ACCESSIBLE_PROPERTY_LEVEL, l + 1);
             }
         }
     }
@@ -767,16 +792,8 @@ final class Gtk4Accessible extends Accessible {
         if (oldText.equals(newText)) {
             return;
         }
-        int prefix = 0;
-        int max = Math.min(oldText.length(), newText.length());
-        while (prefix < max && oldText.charAt(prefix) == newText.charAt(prefix)) {
-            prefix++;
-        }
-        int suffix = 0;
-        while (suffix < max - prefix
-                && oldText.charAt(oldText.length() - 1 - suffix) == newText.charAt(newText.length() - 1 - suffix)) {
-            suffix++;
-        }
+        int prefix = commonPrefix(oldText, newText);
+        int suffix = commonSuffix(oldText, newText, prefix);
         int start = toCodePoints(oldText, prefix);
         int removedEnd = toCodePoints(oldText, oldText.length() - suffix);
         int insertedEnd = toCodePoints(newText, newText.length() - suffix);
@@ -786,6 +803,25 @@ final class Gtk4Accessible extends Accessible {
         if (insertedEnd > start) {
             n.textUpdateContents(peer, TEXT_CONTENT_INSERT, start, insertedEnd);
         }
+    }
+
+    private static int commonPrefix(String a, String b) {
+        int max = Math.min(a.length(), b.length());
+        int prefix = 0;
+        while (prefix < max && a.charAt(prefix) == b.charAt(prefix)) {
+            prefix++;
+        }
+        return prefix;
+    }
+
+    /** The length of the common end of two texts, after their common start. */
+    private static int commonSuffix(String a, String b, int prefix) {
+        int max = Math.min(a.length(), b.length()) - prefix;
+        int suffix = 0;
+        while (suffix < max && a.charAt(a.length() - 1 - suffix) == b.charAt(b.length() - 1 - suffix)) {
+            suffix++;
+        }
+        return suffix;
     }
 
     private void caretChanged() {
@@ -805,34 +841,31 @@ final class Gtk4Accessible extends Accessible {
     private int[] boundary(String s, int offset, int granularity) {
         int length = s.length();
         int pos = Math.max(0, Math.min(offset, length));
-        switch (granularity) {
-            case GRANULARITY_CHARACTER -> {
-                int end = pos < length ? s.offsetByCodePoints(pos, 1) : pos;
-                return new int[] {pos, end};
-            }
-            case GRANULARITY_WORD, GRANULARITY_SENTENCE -> {
-                BreakIterator it = granularity == GRANULARITY_WORD
-                        ? BreakIterator.getWordInstance() : BreakIterator.getSentenceInstance();
-                it.setText(s);
-                int start = it.isBoundary(pos) ? pos : it.preceding(pos);
-                int end = it.following(pos);
-                return new int[] {start == BreakIterator.DONE ? 0 : start, end == BreakIterator.DONE ? length : end};
-            }
-            case GRANULARITY_LINE -> {
-                Object line = getAttribute(LINE_FOR_OFFSET, pos);
-                if (line instanceof Integer l) {
-                    Object start = getAttribute(LINE_START, l);
-                    Object end = getAttribute(LINE_END, l);
-                    if (start instanceof Integer a && end instanceof Integer b) {
-                        return new int[] {a, b};
-                    }
-                }
-                return paragraph(s, pos);
-            }
-            default -> {
-                return paragraph(s, pos);
-            }
+        return switch (granularity) {
+            case GRANULARITY_CHARACTER -> new int[] {pos, pos < length ? s.offsetByCodePoints(pos, 1) : pos};
+            case GRANULARITY_WORD -> breakBoundary(BreakIterator.getWordInstance(), s, pos);
+            case GRANULARITY_SENTENCE -> breakBoundary(BreakIterator.getSentenceInstance(), s, pos);
+            case GRANULARITY_LINE -> lineBoundary(s, pos);
+            default -> paragraph(s, pos);
+        };
+    }
+
+    /** The word or sentence around a position. */
+    private static int[] breakBoundary(BreakIterator it, String s, int pos) {
+        it.setText(s);
+        int start = it.isBoundary(pos) ? pos : it.preceding(pos);
+        int end = it.following(pos);
+        return new int[] {start == BreakIterator.DONE ? 0 : start, end == BreakIterator.DONE ? s.length() : end};
+    }
+
+    /** The line of a position, as the control lays it out, or else its paragraph. */
+    private int[] lineBoundary(String s, int pos) {
+        if (getAttribute(LINE_FOR_OFFSET, pos) instanceof Integer line
+                && getAttribute(LINE_START, line) instanceof Integer start
+                && getAttribute(LINE_END, line) instanceof Integer end) {
+            return new int[] {start, end};
         }
+        return paragraph(s, pos);
     }
 
     private static int[] paragraph(String s, int pos) {
@@ -1372,24 +1405,25 @@ final class Gtk4Accessible extends Accessible {
             enumType = GObjectFunctions.typeFromName("GEnum");
 
             long accessibleType = GtkAccessible.getGType();
-            base = GSubclass.register(GObject.getGType(), "GlassGtk4Accessible", classInitStub);
-            base.addInterface(accessibleType, accessibleInitStub);
-
-            range = GSubclass.register(GObject.getGType(), "GlassGtk4AccessibleRange", classInitStub);
-            range.addInterface(accessibleType, accessibleInitStub);
-            range.addInterface(GtkAccessibleRange.getGType(), rangeInitStub);
-
-            text = GSubclass.register(GObject.getGType(), "GlassGtk4AccessibleText", classInitStub);
-            text.addInterface(accessibleType, accessibleInitStub);
-            text.addInterface(GtkAccessibleText.getGType(), textInitStub);
-
-            textRange = GSubclass.register(GObject.getGType(), "GlassGtk4AccessibleTextRange", classInitStub);
-            textRange.addInterface(accessibleType, accessibleInitStub);
-            textRange.addInterface(GtkAccessibleText.getGType(), textInitStub);
-            textRange.addInterface(GtkAccessibleRange.getGType(), rangeInitStub);
-
+            long rangeType = GtkAccessibleRange.getGType();
+            long textType = GtkAccessibleText.getGType();
+            base = registerAccessible("GlassGtk4Accessible", classInitStub, accessibleInitStub);
+            range = registerAccessible("GlassGtk4AccessibleRange", classInitStub, accessibleInitStub);
+            range.addInterface(rangeType, rangeInitStub);
+            text = registerAccessible("GlassGtk4AccessibleText", classInitStub, accessibleInitStub);
+            text.addInterface(textType, textInitStub);
+            textRange = registerAccessible("GlassGtk4AccessibleTextRange", classInitStub, accessibleInitStub);
+            textRange.addInterface(textType, textInitStub);
+            textRange.addInterface(rangeType, rangeInitStub);
             host = GSubclass.register(GtkBox.getGType(), "GlassGtk4AccessibleHost", null);
             host.addInterface(accessibleType, hostInitStub);
+        }
+
+        /** A GObject type that implements GtkAccessible, for the nodes of the scene. */
+        private static GSubclass registerAccessible(String name, MemorySegment classInit, MemorySegment accessibleInit) {
+            GSubclass type = GSubclass.register(GObject.getGType(), name, classInit);
+            type.addInterface(GtkAccessible.getGType(), accessibleInit);
+            return type;
         }
 
         private MemorySegment up(String name, FunctionDescriptor fd) throws ReflectiveOperationException {

@@ -39,11 +39,11 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.BiConsumer;
 
 /**
  * Conversion between Glass data (as used by the clipboard and drag and drop)
@@ -85,61 +85,82 @@ final class Gtk4DataTransfer {
      */
     static GdkContentProvider createProvider(Map<String, Object> data) {
         List<GdkContentProvider> providers = new ArrayList<>();
-        BiConsumer<String, byte[]> add = (mime, bytes) -> {
-            GBytes gbytes = GBytes.create(bytes);
-            providers.add(GdkContentProvider.createForBytes(mime, gbytes));
-            gbytes.unref();
-        };
-
         for (Map.Entry<String, Object> entry : data.entrySet()) {
-            String mime = entry.getKey();
-            Object value = entry.getValue();
-            switch (mime) {
-                case Clipboard.TEXT_TYPE -> {
-                    if (value instanceof String text) {
-                        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-                        add.accept(TEXT_UTF8, bytes);
-                        add.accept(Clipboard.TEXT_TYPE, bytes);
-                    }
+            addProviders(providers, entry.getKey(), entry.getValue());
+        }
+        String uriList = toUriList(data.get(Clipboard.URI_TYPE), data.get(Clipboard.FILE_LIST_TYPE));
+        if (uriList != null) {
+            providers.add(bytesProvider(Clipboard.URI_TYPE, uriList.getBytes(StandardCharsets.UTF_8)));
+        }
+        // The union owns the providers
+        return GdkContentProvider.createUnion(providers.toArray(new GdkContentProvider[0]));
+    }
+
+    /**
+     * The providers of a format of Glass: text as UTF-8 under two names, an
+     * image as PNG, and the other formats as their bytes. The URIs and the
+     * files are offered together, as one text/uri-list.
+     */
+    private static void addProviders(List<GdkContentProvider> providers, String mime, Object value) {
+        switch (mime) {
+            case Clipboard.TEXT_TYPE -> {
+                if (value instanceof String text) {
+                    byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+                    providers.add(bytesProvider(TEXT_UTF8, bytes));
+                    providers.add(bytesProvider(Clipboard.TEXT_TYPE, bytes));
                 }
-                case Clipboard.RAW_IMAGE_TYPE -> {
-                    if (value instanceof Pixels pixels) {
-                        GdkTexture texture = Gtk4Pixels.toTexture(pixels);
-                        if (texture != null) {
-                            GBytes png = texture.saveToPngBytes();
-                            providers.add(GdkContentProvider.createForBytes("image/png", png));
-                            png.unref();
-                            texture.unref();
-                        }
-                    }
-                }
-                case Clipboard.URI_TYPE, Clipboard.FILE_LIST_TYPE -> {
-                    // Both are offered as one text/uri-list, added below
-                }
-                case Clipboard.DRAG_IMAGE, Clipboard.DRAG_IMAGE_OFFSET -> {
-                    // Used by the drag source only
-                }
-                default -> {
-                    if (value instanceof String text) {
-                        add.accept(mime, text.getBytes(StandardCharsets.UTF_8));
-                    } else if (value instanceof ByteBuffer buffer) {
-                        ByteBuffer copy = buffer.duplicate().rewind();
-                        byte[] bytes = new byte[copy.remaining()];
-                        copy.get(bytes);
-                        add.accept(mime, bytes);
+            }
+            case Clipboard.RAW_IMAGE_TYPE -> {
+                if (value instanceof Pixels pixels) {
+                    GdkContentProvider png = pngProvider(pixels);
+                    if (png != null) {
+                        providers.add(png);
                     }
                 }
             }
+            // Offered by createProvider; the drag image is for the drag source only
+            case Clipboard.URI_TYPE, Clipboard.FILE_LIST_TYPE, Clipboard.DRAG_IMAGE, Clipboard.DRAG_IMAGE_OFFSET -> {
+            }
+            default -> {
+                byte[] bytes = bytesOf(value);
+                if (bytes != null) {
+                    providers.add(bytesProvider(mime, bytes));
+                }
+            }
         }
+    }
 
-        String uriList = toUriList(data.get(Clipboard.URI_TYPE), data.get(Clipboard.FILE_LIST_TYPE));
-        if (uriList != null) {
-            add.accept(Clipboard.URI_TYPE, uriList.getBytes(StandardCharsets.UTF_8));
+    private static GdkContentProvider bytesProvider(String mime, byte[] bytes) {
+        GBytes gbytes = GBytes.create(bytes);
+        GdkContentProvider provider = GdkContentProvider.createForBytes(mime, gbytes);
+        gbytes.unref();
+        return provider;
+    }
+
+    private static GdkContentProvider pngProvider(Pixels pixels) {
+        GdkTexture texture = Gtk4Pixels.toTexture(pixels);
+        if (texture == null) {
+            return null;
         }
+        GBytes png = texture.saveToPngBytes();
+        GdkContentProvider provider = GdkContentProvider.createForBytes("image/png", png);
+        png.unref();
+        texture.unref();
+        return provider;
+    }
 
-        GdkContentProvider union = GdkContentProvider.createUnion(providers.toArray(new GdkContentProvider[0]));
-        // The union owns the providers
-        return union;
+    /** The bytes of a value of a custom format: a text as UTF-8, or a buffer. */
+    private static byte[] bytesOf(Object value) {
+        return switch (value) {
+            case String text -> text.getBytes(StandardCharsets.UTF_8);
+            case ByteBuffer buffer -> {
+                ByteBuffer copy = buffer.duplicate().rewind();
+                byte[] bytes = new byte[copy.remaining()];
+                copy.get(bytes);
+                yield bytes;
+            }
+            case null, default -> null;
+        };
     }
 
     private static String toUriList(Object url, Object files) {
@@ -170,24 +191,14 @@ final class Gtk4DataTransfer {
             return new String[0];
         }
         Set<String> result = new LinkedHashSet<>();
-        String[] mimes = formats.getMimeTypes(null);
         boolean hasImage = false;
-        for (String mime : mimes) {
-            if (mime.startsWith("text/plain") || mime.equals("UTF8_STRING") || mime.equals("STRING")
-                    || mime.equals("TEXT")) {
+        for (String mime : formats.getMimeTypes(null)) {
+            if (isTextType(mime)) {
                 result.add(Clipboard.TEXT_TYPE);
             } else if (mime.equals(Clipboard.URI_TYPE)) {
-                List<String> uris = readUris(source);
-                if (uris.stream().anyMatch(u -> u.startsWith(FILE_PREFIX))) {
-                    result.add(Clipboard.FILE_LIST_TYPE);
-                }
-                if (uris.stream().anyMatch(u -> !u.startsWith(FILE_PREFIX))) {
-                    result.add(Clipboard.URI_TYPE);
-                }
+                addUriTypes(result, readUris(source));
             } else {
-                if (mime.startsWith("image/")) {
-                    hasImage = true;
-                }
+                hasImage |= mime.startsWith("image/");
                 result.add(mime);
             }
         }
@@ -195,6 +206,21 @@ final class Gtk4DataTransfer {
             result.add(Clipboard.RAW_IMAGE_TYPE);
         }
         return result.toArray(new String[0]);
+    }
+
+    private static boolean isTextType(String mime) {
+        return mime.startsWith("text/plain") || mime.equals("UTF8_STRING") || mime.equals("STRING")
+                || mime.equals("TEXT");
+    }
+
+    /** A URI list is a file list of Glass when it has files, and a URI list when it has other URIs. */
+    private static void addUriTypes(Set<String> result, List<String> uris) {
+        if (uris.stream().anyMatch(u -> u.startsWith(FILE_PREFIX))) {
+            result.add(Clipboard.FILE_LIST_TYPE);
+        }
+        if (uris.stream().anyMatch(u -> !u.startsWith(FILE_PREFIX))) {
+            result.add(Clipboard.URI_TYPE);
+        }
     }
 
     /**
@@ -223,40 +249,45 @@ final class Gtk4DataTransfer {
     static Object read(Source source, String mime) {
         try {
             return switch (mime) {
-                case Clipboard.TEXT_TYPE -> {
-                    byte[] bytes = readBytes(source, TEXT_UTF8, Clipboard.TEXT_TYPE, "UTF8_STRING", "STRING");
-                    yield bytes != null ? new String(bytes, StandardCharsets.UTF_8) : null;
-                }
-                case Clipboard.URI_TYPE -> {
-                    // The URIs that are not files, CRLF separated
-                    List<String> uris = readUris(source).stream()
-                            .filter(u -> !u.startsWith(FILE_PREFIX)).toList();
-                    yield uris.isEmpty() ? null : String.join("\r\n", uris);
-                }
-                case Clipboard.FILE_LIST_TYPE -> {
-                    List<String> files = new ArrayList<>();
-                    for (String uri : readUris(source)) {
-                        if (uri.startsWith(FILE_PREFIX)) {
-                            files.add(Path.of(URI.create(uri)).toString());
-                        }
-                    }
-                    yield files.isEmpty() ? null : files.toArray(new String[0]);
-                }
+                case Clipboard.TEXT_TYPE -> readText(source);
+                case Clipboard.URI_TYPE -> readNonFileUris(source);
+                case Clipboard.FILE_LIST_TYPE -> readFiles(source);
                 case Clipboard.RAW_IMAGE_TYPE -> readImage(source);
-                default -> {
-                    byte[] bytes = readBytes(source, mime);
-                    if (bytes == null) {
-                        yield null;
-                    }
-                    yield mime.startsWith("text/")
-                            ? new String(bytes, StandardCharsets.UTF_8)
-                            : ByteBuffer.wrap(bytes);
-                }
+                default -> readCustom(source, mime);
             };
         } catch (GErrorException | IllegalArgumentException e) {
             Gtk4Log.log(CLIPBOARD, "read %s failed: %s", mime, e.getMessage());
             return null;
         }
+    }
+
+    private static String readText(Source source) {
+        byte[] bytes = readBytes(source, TEXT_UTF8, Clipboard.TEXT_TYPE, "UTF8_STRING", "STRING");
+        return bytes != null ? new String(bytes, StandardCharsets.UTF_8) : null;
+    }
+
+    /** The URIs that are not files, CRLF separated. */
+    private static String readNonFileUris(Source source) {
+        List<String> uris = readUris(source).stream().filter(u -> !u.startsWith(FILE_PREFIX)).toList();
+        return uris.isEmpty() ? null : String.join("\r\n", uris);
+    }
+
+    /** The paths of the URIs that are files. */
+    private static String[] readFiles(Source source) {
+        String[] files = readUris(source).stream()
+                .filter(u -> u.startsWith(FILE_PREFIX))
+                .map(u -> Path.of(URI.create(u)).toString())
+                .toArray(String[]::new);
+        return files.length == 0 ? null : files;
+    }
+
+    /** A custom format: a text when its type is text, or else a buffer of its bytes. */
+    private static Object readCustom(Source source, String mime) {
+        byte[] bytes = readBytes(source, mime);
+        if (bytes == null) {
+            return null;
+        }
+        return mime.startsWith("text/") ? new String(bytes, StandardCharsets.UTF_8) : ByteBuffer.wrap(bytes);
     }
 
     private static List<String> readUris(Source source) {
@@ -319,27 +350,29 @@ final class Gtk4DataTransfer {
     /**
      * Reads the content in the first available of the given formats.
      */
+    /** The content of the first of the types that the source has, or null. */
     private static byte[] readBytes(Source source, String... mimeTypes) {
         GdkContentFormats formats = source.getFormats();
-        List<String> available = new ArrayList<>();
-        for (String mime : mimeTypes) {
-            if (formats.containMimeType(mime)) {
-                available.add(mime);
-            }
-        }
-        if (available.isEmpty()) {
+        String[] available = Arrays.stream(mimeTypes).filter(formats::containMimeType).toArray(String[]::new);
+        if (available.length == 0) {
             return null;
         }
-
-        GInputStream input = Gtk4Async.await(
-                cb -> source.readAsync(available.toArray(new String[0]), cb),
-                source::readFinish);
+        GInputStream input = Gtk4Async.await(cb -> source.readAsync(available, cb), source::readFinish);
         if (input.isNull()) {
             return null;
         }
+        try {
+            return readAll(input);
+        } finally {
+            input.unref();
+        }
+    }
 
-        // Splice asynchronously: when the application owns the content, the
-        // data is written from this same main loop
+    /**
+     * Reads a stream to its end, asynchronously: when the application owns
+     * the content, the data is written from this same main loop.
+     */
+    private static byte[] readAll(GInputStream input) {
         GMemoryOutputStream output = GMemoryOutputStream.createResizable();
         try {
             Gtk4Async.await(
@@ -353,7 +386,6 @@ final class Gtk4DataTransfer {
             return data;
         } finally {
             output.unref();
-            input.unref();
         }
     }
 }

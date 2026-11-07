@@ -163,23 +163,32 @@ final class Gtk4BackgroundEffect {
             }
             addRectangle(region, args, REGION_ADD, x, y, width, height);
             int r = Math.min(radius, Math.min(width, height) / 2);
-            for (int row = 0; row < r; row++) {
-                double dy = r - row - 0.5;
-                int inset = (int) Math.ceil(r - Math.sqrt((double) r * r - dy * dy));
-                if (inset <= 0) {
-                    continue;
-                }
-                addRectangle(region, args, REGION_SUBTRACT, x, y + row, inset, 1);
-                addRectangle(region, args, REGION_SUBTRACT, x + width - inset, y + row, inset, 1);
-                addRectangle(region, args, REGION_SUBTRACT, x, y + height - 1 - row, inset, 1);
-                addRectangle(region, args, REGION_SUBTRACT, x + width - inset, y + height - 1 - row, inset, 1);
-            }
+            subtractCorners(region, args, x, y, width, height, r);
             args.setAtIndex(ValueLayout.ADDRESS, 0, region);
             marshal(effect, EFFECT_SET_BLUR_REGION, MemorySegment.NULL, 1, 0, args);
             marshal(region, REGION_DESTROY, MemorySegment.NULL, 1, MARSHAL_FLAG_DESTROY, args);
             Gtk4Log.log(LOG, "blur region %d,%d %dx%d radius %d", x, y, width, height, r);
         } catch (Throwable t) {
             Gtk4Log.log(LOG, "cannot set the blur region: %s", t);
+        }
+    }
+
+    /**
+     * Leaves out of a region the corners outside a circle of a radius, a row
+     * of pixels at a time.
+     */
+    private static void subtractCorners(MemorySegment region, MemorySegment args, int x, int y,
+                                        int width, int height, int r) throws Throwable {
+        for (int row = 0; row < r; row++) {
+            double dy = r - row - 0.5;
+            int inset = (int) Math.ceil(r - Math.sqrt((double) r * r - dy * dy));
+            if (inset <= 0) {
+                continue;
+            }
+            addRectangle(region, args, REGION_SUBTRACT, x, y + row, inset, 1);
+            addRectangle(region, args, REGION_SUBTRACT, x + width - inset, y + row, inset, 1);
+            addRectangle(region, args, REGION_SUBTRACT, x, y + height - 1 - row, inset, 1);
+            addRectangle(region, args, REGION_SUBTRACT, x + width - inset, y + height - 1 - row, inset, 1);
         }
     }
 
@@ -239,27 +248,14 @@ final class Gtk4BackgroundEffect {
                 return;
             }
             MemorySegment gdkDisplay = GdkDisplay.getDefault().getPointer();
-            long waylandType = (long) wl.waylandDisplayGetType.invokeExact();
-            if (gdkDisplay.equals(MemorySegment.NULL)
-                    || (int) wl.typeCheckInstanceIsA.invokeExact(gdkDisplay, waylandType) == 0) {
+            if (!isWaylandDisplay(gdkDisplay)) {
                 Gtk4Log.log(LOG, "background effects need a Wayland display");
                 return;
             }
             display = (MemorySegment) wl.getWlDisplay.invokeExact(gdkDisplay);
             queue = (MemorySegment) wl.createQueue.invokeExact(display);
-
-            // The registry is created on a wrapper so that its events go to the private queue
-            MemorySegment wrapper = (MemorySegment) wl.createWrapper.invokeExact(display);
-            wl.setQueue.invokeExact(wrapper, queue);
-            int version = (int) wl.getVersion.invokeExact(wrapper);
-            try (Arena arena = Arena.ofConfined()) {
-                MemorySegment args = arguments(arena, 1);
-                args.setAtIndex(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
-                registry = marshal(wrapper, DISPLAY_GET_REGISTRY, wl.registryInterface, version, 0, args);
-            }
-            wl.wrapperDestroy.invokeExact(wrapper);
+            registry = createRegistry();
             int ignored = (int) wl.addListener.invokeExact(registry, wl.registryListener, MemorySegment.NULL);
-
             ignored = (int) wl.roundtripQueue.invokeExact(display, queue);
             if (!manager.equals(MemorySegment.NULL)) {
                 // Receive the capabilities
@@ -270,6 +266,26 @@ final class Gtk4BackgroundEffect {
         } catch (Throwable t) {
             Gtk4Log.log(LOG, "background effects are unavailable: %s", t);
             manager = MemorySegment.NULL;
+        }
+    }
+
+    private static boolean isWaylandDisplay(MemorySegment gdkDisplay) throws Throwable {
+        long waylandType = (long) wl.waylandDisplayGetType.invokeExact();
+        return !gdkDisplay.equals(MemorySegment.NULL)
+                && (int) wl.typeCheckInstanceIsA.invokeExact(gdkDisplay, waylandType) != 0;
+    }
+
+    /** The registry, created on a wrapper of the display so that its events go to the private queue. */
+    private static MemorySegment createRegistry() throws Throwable {
+        MemorySegment wrapper = (MemorySegment) wl.createWrapper.invokeExact(display);
+        wl.setQueue.invokeExact(wrapper, queue);
+        int version = (int) wl.getVersion.invokeExact(wrapper);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment args = arguments(arena, 1);
+            args.setAtIndex(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
+            return marshal(wrapper, DISPLAY_GET_REGISTRY, wl.registryInterface, version, 0, args);
+        } finally {
+            wl.wrapperDestroy.invokeExact(wrapper);
         }
     }
 
@@ -344,45 +360,58 @@ final class Gtk4BackgroundEffect {
         final MemorySegment managerListener;
 
         private Wayland(SymbolLookup client, SymbolLookup gtk, SymbolLookup gobject) throws Exception {
-            Linker linker = Linker.nativeLinker();
             ValueLayout ptr = ValueLayout.ADDRESS;
             ValueLayout i32 = ValueLayout.JAVA_INT;
-
-            marshalArrayFlags = linker.downcallHandle(client.find("wl_proxy_marshal_array_flags").orElseThrow(),
+            marshalArrayFlags = function(client, "wl_proxy_marshal_array_flags",
                     FunctionDescriptor.of(ptr, ptr, i32, ptr, i32, i32, ptr));
-            addListener = linker.downcallHandle(client.find("wl_proxy_add_listener").orElseThrow(),
-                    FunctionDescriptor.of(i32, ptr, ptr, ptr));
-            createQueue = linker.downcallHandle(client.find("wl_display_create_queue").orElseThrow(),
-                    FunctionDescriptor.of(ptr, ptr));
-            createWrapper = linker.downcallHandle(client.find("wl_proxy_create_wrapper").orElseThrow(),
-                    FunctionDescriptor.of(ptr, ptr));
-            wrapperDestroy = linker.downcallHandle(client.find("wl_proxy_wrapper_destroy").orElseThrow(),
-                    FunctionDescriptor.ofVoid(ptr));
-            setQueue = linker.downcallHandle(client.find("wl_proxy_set_queue").orElseThrow(),
-                    FunctionDescriptor.ofVoid(ptr, ptr));
-            getVersion = linker.downcallHandle(client.find("wl_proxy_get_version").orElseThrow(),
-                    FunctionDescriptor.of(i32, ptr));
-            roundtripQueue = linker.downcallHandle(client.find("wl_display_roundtrip_queue").orElseThrow(),
+            addListener = function(client, "wl_proxy_add_listener", FunctionDescriptor.of(i32, ptr, ptr, ptr));
+            createQueue = function(client, "wl_display_create_queue", FunctionDescriptor.of(ptr, ptr));
+            createWrapper = function(client, "wl_proxy_create_wrapper", FunctionDescriptor.of(ptr, ptr));
+            wrapperDestroy = function(client, "wl_proxy_wrapper_destroy", FunctionDescriptor.ofVoid(ptr));
+            setQueue = function(client, "wl_proxy_set_queue", FunctionDescriptor.ofVoid(ptr, ptr));
+            getVersion = function(client, "wl_proxy_get_version", FunctionDescriptor.of(i32, ptr));
+            roundtripQueue = function(client, "wl_display_roundtrip_queue", FunctionDescriptor.of(i32, ptr, ptr));
+            dispatchQueuePending = function(client, "wl_display_dispatch_queue_pending",
                     FunctionDescriptor.of(i32, ptr, ptr));
-            dispatchQueuePending = linker.downcallHandle(client.find("wl_display_dispatch_queue_pending").orElseThrow(),
-                    FunctionDescriptor.of(i32, ptr, ptr));
-            getWlDisplay = linker.downcallHandle(gtk.find("gdk_wayland_display_get_wl_display").orElseThrow(),
-                    FunctionDescriptor.of(ptr, ptr));
-            getWlSurface = linker.downcallHandle(gtk.find("gdk_wayland_surface_get_wl_surface").orElseThrow(),
-                    FunctionDescriptor.of(ptr, ptr));
-            waylandDisplayGetType = linker.downcallHandle(gtk.find("gdk_wayland_display_get_type").orElseThrow(),
+            getWlDisplay = function(gtk, "gdk_wayland_display_get_wl_display", FunctionDescriptor.of(ptr, ptr));
+            getWlSurface = function(gtk, "gdk_wayland_surface_get_wl_surface", FunctionDescriptor.of(ptr, ptr));
+            waylandDisplayGetType = function(gtk, "gdk_wayland_display_get_type",
                     FunctionDescriptor.of(ValueLayout.JAVA_LONG));
-            typeCheckInstanceIsA = linker.downcallHandle(gobject.find("g_type_check_instance_is_a").orElseThrow(),
+            typeCheckInstanceIsA = function(gobject, "g_type_check_instance_is_a",
                     FunctionDescriptor.of(i32, ptr, ValueLayout.JAVA_LONG));
 
-            registryInterface = client.find("wl_registry_interface").orElseThrow().reinterpret(INTERFACE_SIZE);
-            compositorInterface = client.find("wl_compositor_interface").orElseThrow().reinterpret(INTERFACE_SIZE);
-            regionInterface = client.find("wl_region_interface").orElseThrow().reinterpret(INTERFACE_SIZE);
-            MemorySegment surfaceInterface = client.find("wl_surface_interface").orElseThrow().reinterpret(INTERFACE_SIZE);
-
+            registryInterface = interfaceOf(client, "wl_registry_interface");
+            compositorInterface = interfaceOf(client, "wl_compositor_interface");
+            regionInterface = interfaceOf(client, "wl_region_interface");
             Arena arena = Arena.global();
             managerInterface = arena.allocate(INTERFACE_SIZE, 8);
             effectInterface = arena.allocate(INTERFACE_SIZE, 8);
+            defineEffectInterfaces(arena, interfaceOf(client, "wl_surface_interface"));
+
+            registryListener = pointers(arena,
+                    listener(arena, "onGlobal", FunctionDescriptor.ofVoid(ptr, ptr, i32, ptr, i32)),
+                    listener(arena, "onGlobalRemove", FunctionDescriptor.ofVoid(ptr, ptr, i32)));
+            managerListener = pointers(arena, listener(arena, "onCapabilities", FunctionDescriptor.ofVoid(ptr, ptr, i32)));
+        }
+
+        private static MethodHandle function(SymbolLookup library, String name, FunctionDescriptor descriptor) {
+            return Linker.nativeLinker().downcallHandle(library.find(name).orElseThrow(), descriptor);
+        }
+
+        private static MemorySegment interfaceOf(SymbolLookup client, String name) {
+            return client.find(name).orElseThrow().reinterpret(INTERFACE_SIZE);
+        }
+
+        /** An event of a listener, handled by a static method of the same name. */
+        private static MemorySegment listener(Arena arena, String method, FunctionDescriptor descriptor)
+                throws ReflectiveOperationException {
+            MethodHandle handle = MethodHandles.lookup().findStatic(Gtk4BackgroundEffect.class, method,
+                    descriptor.toMethodType());
+            return Linker.nativeLinker().upcallStub(handle, descriptor, arena);
+        }
+
+        /** The interfaces of ext-background-effect-v1, which libwayland-client does not know. */
+        private void defineEffectInterfaces(Arena arena, MemorySegment surfaceInterface) {
             defineInterface(arena, managerInterface, MANAGER_NAME,
                     new String[][] {{"destroy", ""}, {"get_background_effect", "no"}},
                     new MemorySegment[][] {{}, {effectInterface, surfaceInterface}},
@@ -392,22 +421,6 @@ final class Gtk4BackgroundEffect {
                     new String[][] {{"destroy", ""}, {"set_blur_region", "?o"}},
                     new MemorySegment[][] {{}, {regionInterface}},
                     new String[0][], new MemorySegment[0][]);
-
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-            MemorySegment global = linker.upcallStub(
-                    lookup.findStatic(Gtk4BackgroundEffect.class, "onGlobal", MethodType.methodType(void.class,
-                            MemorySegment.class, MemorySegment.class, int.class, MemorySegment.class, int.class)),
-                    FunctionDescriptor.ofVoid(ptr, ptr, i32, ptr, i32), arena);
-            MemorySegment globalRemove = linker.upcallStub(
-                    lookup.findStatic(Gtk4BackgroundEffect.class, "onGlobalRemove", MethodType.methodType(void.class,
-                            MemorySegment.class, MemorySegment.class, int.class)),
-                    FunctionDescriptor.ofVoid(ptr, ptr, i32), arena);
-            MemorySegment caps = linker.upcallStub(
-                    lookup.findStatic(Gtk4BackgroundEffect.class, "onCapabilities", MethodType.methodType(void.class,
-                            MemorySegment.class, MemorySegment.class, int.class)),
-                    FunctionDescriptor.ofVoid(ptr, ptr, i32), arena);
-            registryListener = pointers(arena, global, globalRemove);
-            managerListener = pointers(arena, caps);
         }
 
         static Wayland load() {

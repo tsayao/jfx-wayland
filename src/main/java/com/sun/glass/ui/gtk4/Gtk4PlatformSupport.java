@@ -97,8 +97,17 @@ final class Gtk4PlatformSupport {
 
     private static Map<String, Object> collect() {
         Map<String, Object> prefs = new HashMap<>();
+        collectColors(prefs);
+        collectSettings(prefs);
+        GNetworkMonitor monitor = GNetworkMonitor.getDefault();
+        if (!monitor.isNull()) {
+            prefs.put("GTK.network_metered", monitor.getNetworkMetered());
+        }
+        return prefs;
+    }
 
-        // Named colors are resolved through the style context of a widget
+    /** The named colors of the theme, resolved through the style context of a widget. */
+    private static void collectColors(Map<String, Object> prefs) {
         GtkBox widget = GtkBox.create(Gtk.ORIENTATION_VERTICAL, 0);
         widget.refSink();
         try {
@@ -106,31 +115,28 @@ final class Gtk4PlatformSupport {
             GdkRGBA rgba = new GdkRGBA(0, 0, 0, 0);
             for (String name : COLORS) {
                 if (style.lookupColor(name, rgba)) {
-                    prefs.put("GTK." + name, Color.color(
-                            clamp(rgba.red()), clamp(rgba.green()), clamp(rgba.blue())));
+                    prefs.put("GTK." + name, Color.color(clamp(rgba.red()), clamp(rgba.green()), clamp(rgba.blue())));
                 }
             }
         } finally {
             widget.unref();
         }
+    }
 
+    /** The theme name, and whether animations and overlay scrolling are on. */
+    private static void collectSettings(Map<String, Object> prefs) {
         GtkSettings settings = GtkSettings.getDefault();
-        if (settings != null && !settings.isNull()) {
-            String themeName = settings.getStringProperty("gtk-theme-name");
-            if (themeName != null) {
-                prefs.put("GTK.theme_name", themeName);
-            }
-            prefs.put("GTK.enable_animations", settings.getBooleanProperty("gtk-enable-animations"));
-            if (settings.hasProperty("gtk-overlay-scrolling")) {
-                prefs.put("GTK.overlay_scrolling", settings.getBooleanProperty("gtk-overlay-scrolling"));
-            }
+        if (settings == null || settings.isNull()) {
+            return;
         }
-
-        GNetworkMonitor monitor = GNetworkMonitor.getDefault();
-        if (!monitor.isNull()) {
-            prefs.put("GTK.network_metered", monitor.getNetworkMetered());
+        String themeName = settings.getStringProperty("gtk-theme-name");
+        if (themeName != null) {
+            prefs.put("GTK.theme_name", themeName);
         }
-        return prefs;
+        prefs.put("GTK.enable_animations", settings.getBooleanProperty("gtk-enable-animations"));
+        if (settings.hasProperty("gtk-overlay-scrolling")) {
+            prefs.put("GTK.overlay_scrolling", settings.getBooleanProperty("gtk-overlay-scrolling"));
+        }
     }
 
     private static double clamp(float value) {

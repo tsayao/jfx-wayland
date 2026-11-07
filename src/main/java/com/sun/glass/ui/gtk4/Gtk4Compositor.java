@@ -194,8 +194,7 @@ final class Gtk4Compositor {
                 new ExternalFrame(dup, stride, offset, fourcc, modifier, width, height, release));
         if (old != null) {
             // Superseded before it was shown
-            closeFd(old.fd());
-            old.release().run();
+            release(old);
         }
         if (externalUpdateScheduled.compareAndSet(false, true)) {
             Application.invokeLater(this::showExternalFrame);
@@ -210,11 +209,33 @@ final class Gtk4Compositor {
             return;
         }
         if (disposed) {
-            closeFd(frame.fd());
-            frame.release().run();
+            release(frame);
             return;
         }
+        GdkTexture texture = importFrame(frame);
+        if (texture == null) {
+            Gtk4Log.log(COMPOSITOR, "showExternalFrame: cannot import the dma-buf");
+            return;
+        }
+        picture.setPaintable(texture);
+        // GTK keeps the texture while it is shown; the destroy notify releases the buffer
+        if (externalTexture != null) {
+            externalTexture.unref();
+        }
+        externalTexture = texture;
+    }
 
+    /** Closes the descriptor of a frame and gives its buffer back to the pipeline. */
+    private static void release(ExternalFrame frame) {
+        closeFd(frame.fd());
+        frame.release().run();
+    }
+
+    /**
+     * A texture of the dma-buf of a frame, whose destroy notify releases the
+     * frame, or null, after releasing it, when GTK cannot import it.
+     */
+    private static GdkTexture importFrame(ExternalFrame frame) {
         GdkDmabufTextureBuilder builder = GdkDmabufTextureBuilder.create();
         builder.setDisplay(GdkDisplay.getDefault());
         builder.setWidth(frame.width());
@@ -225,29 +246,18 @@ final class Gtk4Compositor {
         builder.setFd(0, frame.fd());
         builder.setStride(0, frame.stride());
         builder.setOffset(0, frame.offset());
-
         long token = EXTERNAL_TOKENS.getAndIncrement();
-        EXTERNAL_RELEASES.put(token, () -> {
-            closeFd(frame.fd());
-            frame.release().run();
-        });
+        EXTERNAL_RELEASES.put(token, () -> release(frame));
         GdkTexture texture = builder.build(EXTERNAL_DESTROY_NOTIFY, MemorySegment.ofAddress(token));
         builder.unref();
-        if (texture.isNull()) {
-            Gtk4Log.log(COMPOSITOR, "showExternalFrame: cannot import the dma-buf");
-            Runnable cleanup = EXTERNAL_RELEASES.remove(token);
-            if (cleanup != null) {
-                cleanup.run();
-            }
-            return;
+        if (!texture.isNull()) {
+            return texture;
         }
-
-        picture.setPaintable(texture);
-        // GTK keeps the texture while it is shown; the destroy notify releases the buffer
-        if (externalTexture != null) {
-            externalTexture.unref();
+        Runnable cleanup = EXTERNAL_RELEASES.remove(token);
+        if (cleanup != null) {
+            cleanup.run();
         }
-        externalTexture = texture;
+        return null;
     }
 
     @SuppressWarnings("unused")
@@ -279,8 +289,7 @@ final class Gtk4Compositor {
         }
         ExternalFrame external = pendingExternal.getAndSet(null);
         if (external != null) {
-            closeFd(external.fd());
-            external.release().run();
+            release(external);
         }
     }
 

@@ -199,32 +199,49 @@ final class Gtk4DnD {
         if (actions == 0) {
             return Clipboard.ACTION_NONE;
         }
-
         Gtk4View view = Gtk4View.getLastPressedView();
-        double[] start = view != null ? view.getLastPressSurfacePosition() : null;
-        Gtk4Window window = view != null && view.getWindow() instanceof Gtk4Window w ? w : null;
-        if (start == null || window == null || window.getSurface() == null) {
-            Gtk4Log.log(DND, "executeDrag: no pressed view to drag from");
+        GdkDrag drag = view != null ? beginDrag(view, data, actions) : null;
+        if (drag == null) {
             return Clipboard.ACTION_NONE;
         }
+        Gtk4Log.log(DND, "executeDrag: started actions=0x%x", actions);
+        setDragIcon(drag, data);
+        try {
+            runDragLoop(drag);
+        } finally {
+            drag.unref();
+            // The release that ended the drag was not delivered to the view
+            view.resetPressedButtons();
+        }
+        Gtk4Log.log(DND, "executeDrag: finished action=%d", performedAction);
+        return performedAction;
+    }
 
+    /** Starts a drag from the point where the view was pressed, or returns null. */
+    private static GdkDrag beginDrag(Gtk4View view, Map<String, Object> data, int actions) {
+        double[] start = view.getLastPressSurfacePosition();
+        Gtk4Window window = view.getWindow() instanceof Gtk4Window w ? w : null;
+        if (start == null || window == null || window.getSurface() == null) {
+            Gtk4Log.log(DND, "executeDrag: no pressed view to drag from");
+            return null;
+        }
         GdkDevice pointer = GdkDisplay.getDefault().getDefaultSeat().getPointer_();
         GdkContentProvider content = Gtk4DataTransfer.createProvider(data);
         GdkDrag drag = GdkDrag.begin(window.getSurface(), pointer, content, actions, start[0], start[1]);
         content.unref();
         if (drag.isNull()) {
             Gtk4Log.log(DND, "executeDrag: gdk_drag_begin failed");
-            return Clipboard.ACTION_NONE;
+            return null;
         }
-        Gtk4Log.log(DND, "executeDrag: started actions=0x%x", actions);
+        return drag;
+    }
 
-        setDragIcon(drag, data);
-
+    /** Runs a nested event loop until the drag is dropped or cancelled. */
+    private static void runDragLoop(GdkDrag drag) {
         Gtk4SignalHelper signals = new Gtk4SignalHelper(Arena.ofConfined(), MethodHandles.lookup());
         DragListener listener = new DragListener();
         signals.connect(drag, "dnd-finished", listener, "onFinished", void.class, GObject.class);
         signals.connect(drag, "cancel", listener, "onCancel", void.class, GObject.class, int.class);
-
         currentDrag = drag;
         performedAction = Clipboard.ACTION_NONE;
         try {
@@ -236,12 +253,7 @@ final class Gtk4DnD {
             dragLoop = null;
             currentDrag = null;
             signals.disconnectAllSignals();
-            drag.unref();
-            // The release that ended the drag was not delivered to the view
-            view.resetPressedButtons();
         }
-        Gtk4Log.log(DND, "executeDrag: finished action=%d", performedAction);
-        return performedAction;
     }
 
     static boolean isDragging() {
@@ -284,50 +296,64 @@ final class Gtk4DnD {
      * Shows the drag image, if any, as the drag icon.
      */
     private static void setDragIcon(GdkDrag drag, Map<String, Object> data) {
-        GdkTexture texture = null;
-        int width = 0;
-        int height = 0;
-
-        if (data.get(Clipboard.DRAG_IMAGE) instanceof ByteBuffer image) {
-            // Two big-endian ints, width and height, followed by BGRA pixels
-            // that are not premultiplied
-            ByteBuffer buffer = image.duplicate().rewind().order(ByteOrder.BIG_ENDIAN);
-            if (buffer.remaining() > 8) {
-                width = buffer.getInt();
-                height = buffer.getInt();
-                if (width > 0 && height > 0 && (long) width * height * 4 <= buffer.remaining()) {
-                    byte[] pixels = new byte[width * height * 4];
-                    buffer.get(pixels);
-                    GBytes bytes = GBytes.create(pixels);
-                    texture = GdkMemoryTexture.create(width, height, Gdk.MEMORY_B8G8R8A8, bytes, width * 4L);
-                    bytes.unref();
-                }
-            }
-        } else if (data.get(Clipboard.RAW_IMAGE_TYPE) instanceof Pixels pixels) {
-            texture = Gtk4Pixels.toTexture(pixels);
-            width = pixels.getWidth();
-            height = pixels.getHeight();
-        }
-        if (texture == null) {
+        DragImage image = dragImage(data);
+        if (image == null) {
             return;
         }
+        int[] hotspot = hotspot(data, image);
+        GtkPicture picture = GtkPicture.createForPaintable(image.texture());
+        double scale = Math.min(1.0, Math.min((double) DRAG_IMAGE_MAX_SIZE / image.width(),
+                (double) DRAG_IMAGE_MAX_SIZE / image.height()));
+        picture.setSizeRequest((int) (image.width() * scale), (int) (image.height() * scale));
+        GtkDragIcon.createGetForDrag(drag).setChild(picture);
+        drag.setHotspot((int) (hotspot[0] * scale), (int) (hotspot[1] * scale));
+        image.texture().unref();
+    }
 
-        int hotX = width / 2;
-        int hotY = height / 2;
+    private record DragImage(GdkTexture texture, int width, int height) {}
+
+    /** The image of a drag: the drag image of Glass, or else an image dragged. */
+    private static DragImage dragImage(Map<String, Object> data) {
+        if (data.get(Clipboard.DRAG_IMAGE) instanceof ByteBuffer image) {
+            return decodeDragImage(image);
+        }
+        if (data.get(Clipboard.RAW_IMAGE_TYPE) instanceof Pixels pixels) {
+            GdkTexture texture = Gtk4Pixels.toTexture(pixels);
+            return texture != null ? new DragImage(texture, pixels.getWidth(), pixels.getHeight()) : null;
+        }
+        return null;
+    }
+
+    /**
+     * A drag image of Glass: two big-endian ints, width and height, followed
+     * by BGRA pixels that are not premultiplied.
+     */
+    private static DragImage decodeDragImage(ByteBuffer image) {
+        ByteBuffer buffer = image.duplicate().rewind().order(ByteOrder.BIG_ENDIAN);
+        if (buffer.remaining() <= 8) {
+            return null;
+        }
+        int width = buffer.getInt();
+        int height = buffer.getInt();
+        if (width <= 0 || height <= 0 || (long) width * height * 4 > buffer.remaining()) {
+            return null;
+        }
+        byte[] pixels = new byte[width * height * 4];
+        buffer.get(pixels);
+        GBytes bytes = GBytes.create(pixels);
+        GdkTexture texture = GdkMemoryTexture.create(width, height, Gdk.MEMORY_B8G8R8A8, bytes, width * 4L);
+        bytes.unref();
+        return new DragImage(texture, width, height);
+    }
+
+    /** The point of the image under the pointer: the offset of Glass, or else the center. */
+    private static int[] hotspot(Map<String, Object> data, DragImage image) {
         if (data.get(Clipboard.DRAG_IMAGE_OFFSET) instanceof ByteBuffer offset) {
             ByteBuffer buffer = offset.duplicate().rewind().order(ByteOrder.BIG_ENDIAN);
             if (buffer.remaining() >= 8) {
-                hotX = buffer.getInt();
-                hotY = buffer.getInt();
+                return new int[] {buffer.getInt(), buffer.getInt()};
             }
         }
-
-        GtkPicture picture = GtkPicture.createForPaintable(texture);
-        double scale = Math.min(1.0, Math.min((double) DRAG_IMAGE_MAX_SIZE / width,
-                (double) DRAG_IMAGE_MAX_SIZE / height));
-        picture.setSizeRequest((int) (width * scale), (int) (height * scale));
-        GtkDragIcon.createGetForDrag(drag).setChild(picture);
-        drag.setHotspot((int) (hotX * scale), (int) (hotY * scale));
-        texture.unref();
+        return new int[] {image.width() / 2, image.height() / 2};
     }
 }

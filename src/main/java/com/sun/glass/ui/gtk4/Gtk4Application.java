@@ -529,49 +529,51 @@ public final class Gtk4Application extends Application {
             Gtk4Log.log(SCREEN, "staticScreen_getScreens: no display");
             return new Screen[0];
         }
-
         GListModel monitors = display.getMonitors();
         int count = monitors.getNItems();
         Gtk4Log.log(SCREEN, "staticScreen_getScreens: monitorCount=%d", count);
-
         Screen[] screens = new Screen[count];
-        GdkRectangle geometry = new GdkRectangle(0, 0, 0, 0);
         for (int i = 0; i < count; i++) {
             GdkMonitor monitor = monitors.getObject(i).cast(GdkMonitor::new);
-            monitor.getGeometry(geometry);
-            int x = geometry.x();
-            int y = geometry.y();
-            int w = geometry.width();
-            int h = geometry.height();
-            float scale = UI_SCALE_OVERRIDE > 0 ? UI_SCALE_OVERRIDE : (float) Math.max(1.0, monitor.getScale());
-
-            int mmW = monitor.getWidthMm();
-            int mmH = monitor.getHeightMm();
-            int dpiX = (mmW <= 0) ? 96 : (int) Math.round(w * scale * 25.4 / mmW);
-            int dpiY = (mmH <= 0) ? 96 : (int) Math.round(h * scale * 25.4 / mmH);
-
+            screens[i] = toScreen(i, monitor);
             monitor.unref();
-
-            Gtk4Log.log(SCREEN, "screen[%d]: x=%d y=%d %dx%d scale=%.2f dpi=%dx%d",
-                    i, x, y, w, h, scale, dpiX, dpiY);
-
-            int[] visible = Gtk4TestSession.isEnabled() ? Gtk4TestSession.getWorkArea(x, y, w, h) : null;
-            if (visible == null) {
-                visible = new int[] {x, y, w, h};
-            }
-
-            // GTK4 coordinates are logical, so the platform scale is 1. The output
-            // scale makes Prism render at the physical resolution of the monitor.
-            // Wayland has no work area, so the visible bounds are the full bounds.
-            screens[i] = new Screen(i, 32,
-                    x, y, w, h,
-                    x, y, w, h,
-                    visible[0], visible[1], visible[2], visible[3],
-                    dpiX, dpiY,
-                    1.0f, 1.0f,
-                    scale, scale);
         }
         return screens;
+    }
+
+    /**
+     * The Glass screen of a monitor. GTK 4 coordinates are logical, so the
+     * platform scale is 1; the output scale makes Prism render at the
+     * physical resolution of the monitor. Wayland has no work area, so the
+     * visible bounds are the full bounds, except in a test session.
+     */
+    private static Screen toScreen(int index, GdkMonitor monitor) {
+        GdkRectangle geometry = new GdkRectangle(0, 0, 0, 0);
+        monitor.getGeometry(geometry);
+        int x = geometry.x();
+        int y = geometry.y();
+        int w = geometry.width();
+        int h = geometry.height();
+        float scale = UI_SCALE_OVERRIDE > 0 ? UI_SCALE_OVERRIDE : (float) Math.max(1.0, monitor.getScale());
+        int dpiX = dpi(w * scale, monitor.getWidthMm());
+        int dpiY = dpi(h * scale, monitor.getHeightMm());
+        Gtk4Log.log(SCREEN, "screen[%d]: x=%d y=%d %dx%d scale=%.2f dpi=%dx%d", index, x, y, w, h, scale, dpiX, dpiY);
+        int[] visible = Gtk4TestSession.isEnabled() ? Gtk4TestSession.getWorkArea(x, y, w, h) : null;
+        if (visible == null) {
+            visible = new int[] {x, y, w, h};
+        }
+        return new Screen(index, 32,
+                x, y, w, h,
+                x, y, w, h,
+                visible[0], visible[1], visible[2], visible[3],
+                dpiX, dpiY,
+                1.0f, 1.0f,
+                scale, scale);
+    }
+
+    /** The resolution of pixels over millimeters, or 96 when the size is not known. */
+    private static int dpi(double pixels, int millimeters) {
+        return millimeters <= 0 ? 96 : (int) Math.round(pixels * 25.4 / millimeters);
     }
 
     @Override

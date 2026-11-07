@@ -86,23 +86,12 @@ final class Gtk4GestureSupport {
             case Gdk.TOUCH_UPDATE -> TouchEvent.TOUCH_MOVED;
             default -> TouchEvent.TOUCH_RELEASED;
         };
-        if (state == TouchEvent.TOUCH_PRESSED) {
-            points.put(id, new int[] {x, y, xAbs, yAbs});
-        } else if (!points.containsKey(id)) {
+        if (state != TouchEvent.TOUCH_PRESSED && !points.containsKey(id)) {
             return;
-        } else {
-            points.put(id, new int[] {x, y, xAbs, yAbs});
         }
+        points.put(id, new int[] {x, y, xAbs, yAbs});
         touchModifiers = modifiers;
-
-        touches.notifyBeginTouchEvent(view, modifiers, true, points.size());
-        for (Map.Entry<Long, int[]> e : points.entrySet()) {
-            int[] p = e.getValue();
-            int pointState = e.getKey() == id ? state : TouchEvent.TOUCH_STILL;
-            touches.notifyNextTouchEvent(view, pointState, e.getKey(), p[0], p[1], p[2], p[3]);
-        }
-        touches.notifyEndTouchEvent(view);
-
+        notifyTouchPoints(view, id, state, modifiers);
         if (state == TouchEvent.TOUCH_RELEASED) {
             points.remove(id);
         }
@@ -113,6 +102,17 @@ final class Gtk4GestureSupport {
             performTouchGestures(view, modifiers);
         }
         touchFinished(view, count);
+    }
+
+    /** A touch event with every point down: the one that changed, and the others still. */
+    private static void notifyTouchPoints(View view, long id, int state, int modifiers) {
+        touches.notifyBeginTouchEvent(view, modifiers, true, points.size());
+        for (Map.Entry<Long, int[]> e : points.entrySet()) {
+            int[] p = e.getValue();
+            int pointState = e.getKey() == id ? state : TouchEvent.TOUCH_STILL;
+            touches.notifyNextTouchEvent(view, pointState, e.getKey(), p[0], p[1], p[2], p[3]);
+        }
+        touches.notifyEndTouchEvent(view);
     }
 
     private static void resetBase() {
