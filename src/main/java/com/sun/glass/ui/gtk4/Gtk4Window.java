@@ -307,20 +307,34 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         frameType = toFrameType(mask);
         backdrop = Gtk4Application.BACKDROP && windowType != WindowType.POPUP
                 && frameType != GtkWindowFrameType.TRANSPARENT && Gtk4BackgroundEffect.isSupported();
-
         owner = ownerPtr != 0L ? windowMap.get(ownerPtr) : null;
         if (owner != null) {
             owner.children.add(this);
         }
-
         windowArena = Arena.ofShared();
         signals = new Gtk4SignalHelper(windowArena, MethodHandles.lookup());
+        createContent();
+        if (windowType == WindowType.POPUP) {
+            initializePopup();
+        } else {
+            initializeToplevel(mask);
+        }
+        ptr = PTR_COUNTER.getAndIncrement();
+        windowMap.put(ptr, this);
+        Gtk4Log.log(LIFECYCLE, "_createWindow: windowType=%s frameType=%s owner=%s",
+                windowType, frameType, owner);
+        return ptr;
+    }
 
+    /**
+     * The widgets of the content: the view, which shows the frames, in its
+     * container, which is the host of the accessibility of the scene.
+     */
+    private void createContent() {
         compositor = new Gtk4Compositor(!(hasBackdrop() && Gtk4BackgroundEffect.isManagedByGtk()));
         viewWidget = compositor.getWidget();
         viewWidget.setFocusable(true);
         viewWidget.setCanFocus(true);
-
         Gtk4Accessible.hideFromAccessibility(viewWidget);
         containerWidget = Gtk4Accessible.createHost(this);
         if (containerWidget == null) {
@@ -330,44 +344,28 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         containerWidget.setVExpand(true);
         containerWidget.append(viewWidget);
         contentLayout = new Gtk4ContentLayout(containerWidget, windowArena);
-
-        if (windowType == WindowType.POPUP) {
-            initializePopup();
-        } else {
-            initializeToplevel(mask);
-        }
-
-        ptr = PTR_COUNTER.getAndIncrement();
-        windowMap.put(ptr, this);
-        Gtk4Log.log(LIFECYCLE, "_createWindow: windowType=%s frameType=%s owner=%s",
-                windowType, frameType, owner);
-        return ptr;
     }
 
     private void initializeToplevel(int mask) {
-        if (Gtk4Application.ADWAITA) {
-            gtkWindow = AdwWindow.create();
+        gtkWindow = Gtk4Application.ADWAITA ? AdwWindow.create() : GtkWindow.create();
+        if (gtkWindow instanceof AdwWindow) {
             gtkWindow.setSizeRequest(-1, -1);
-        } else {
-            gtkWindow = GtkWindow.create();
         }
         gtkWindow.setTitle("");
-
-        if (owner != null) {
-            GtkWindow ownerWindow = owner.gtkWindow;
-            if (ownerWindow != null) {
-                gtkWindow.setTransientFor(ownerWindow);
-            }
-            if ((mask & Window.MODAL) != 0) {
-                gtkWindow.setModal(true);
-            }
+        if (owner != null && owner.gtkWindow != null) {
+            gtkWindow.setTransientFor(owner.gtkWindow);
         }
-
+        if (owner != null && (mask & Window.MODAL) != 0) {
+            gtkWindow.setModal(true);
+        }
         configureWindowContent(mask);
         if (hasBackdrop()) {
             gtkWindow.addCssClass("jfx-backdrop");
         }
+        connectToplevelSignals();
+    }
 
+    private void connectToplevelSignals() {
         signals.connect(gtkWindow, "realize", this, "onRealize", void.class, GtkWidget.class);
         signals.connect(gtkWindow, "unrealize", this, "onUnrealize", void.class, GtkWidget.class);
         signals.connect(gtkWindow, "map", this, "onMap", void.class, GtkWidget.class);
@@ -401,58 +399,58 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
     private void configureWindowContent(int mask) {
         Gtk4Log.log(HEADERBAR, "configureWindowContent: frameType=%s", frameType);
         switch (frameType) {
-            case TITLED -> {
-                gtkWindow.setDeletable((mask & Window.CLOSABLE) != 0);
-                if (gtkWindow instanceof AdwWindow adwWindow) {
-                    AdwHeaderBar adwHeaderBar = AdwHeaderBar.create();
-                    adwHeaderBar.setDecorationLayout(decorationLayout(mask));
-                    GtkBox box = GtkBox.create(Gtk.ORIENTATION_VERTICAL, 0);
-                    box.append(adwHeaderBar);
-                    box.append(containerWidget);
-                    adwWindow.setContent(box);
-                    headerBar = adwHeaderBar;
-                } else {
-                    GtkHeaderBar gtkHeaderBar = GtkHeaderBar.create();
-                    gtkHeaderBar.setDecorationLayout(decorationLayout(mask));
-                    gtkWindow.setTitlebar(gtkHeaderBar);
-                    gtkWindow.setChild(containerWidget);
-                    headerBar = gtkHeaderBar;
-                }
-            }
-            case UNTITLED -> {
-                gtkWindow.setDecorated(false);
-                gtkWindow.addCssClass("jfx-undecorated");
-                setWindowContent(containerWidget);
-            }
-            case EXTENDED -> {
-                if (!(gtkWindow instanceof AdwWindow)) {
-                    // An empty titlebar keeps the client-side shadow and resize area
-                    // without a visible header
-                    GtkBox titlebar = GtkBox.create(Gtk.ORIENTATION_HORIZONTAL, 0);
-                    titlebar.setVisible(false);
-                    gtkWindow.setTitlebar(titlebar);
-                }
-
-                GtkOverlay overlay = GtkOverlay.create();
-                overlay.setChild(containerWidget);
-
-                GtkWindowControls start = GtkWindowControls.create(Gtk.PACK_START);
-                overlay.addOverlay(headerControls(start, Gtk.ALIGN_START));
-
-                GtkWindowControls end = GtkWindowControls.create(Gtk.PACK_END);
-                overlay.addOverlay(headerControls(end, Gtk.ALIGN_END));
-
-                nativeHeaderControlsStart = start;
-                nativeHeaderControlsEnd = end;
-                applyNativeHeaderControlsPreferences();
-                setWindowContent(overlay);
-            }
-            case TRANSPARENT -> {
-                gtkWindow.setDecorated(false);
-                gtkWindow.addCssClass("jfx-transparent");
-                setWindowContent(containerWidget);
-            }
+            case TITLED -> configureTitled(mask);
+            case UNTITLED -> configureUndecorated("jfx-undecorated");
+            case EXTENDED -> configureExtended();
+            case TRANSPARENT -> configureUndecorated("jfx-transparent");
         }
+    }
+
+    /** A header bar with the buttons the window allows, above the content. */
+    private void configureTitled(int mask) {
+        gtkWindow.setDeletable((mask & Window.CLOSABLE) != 0);
+        if (gtkWindow instanceof AdwWindow adwWindow) {
+            AdwHeaderBar adwHeaderBar = AdwHeaderBar.create();
+            adwHeaderBar.setDecorationLayout(decorationLayout(mask));
+            GtkBox box = GtkBox.create(Gtk.ORIENTATION_VERTICAL, 0);
+            box.append(adwHeaderBar);
+            box.append(containerWidget);
+            adwWindow.setContent(box);
+            headerBar = adwHeaderBar;
+        } else {
+            GtkHeaderBar gtkHeaderBar = GtkHeaderBar.create();
+            gtkHeaderBar.setDecorationLayout(decorationLayout(mask));
+            gtkWindow.setTitlebar(gtkHeaderBar);
+            gtkWindow.setChild(containerWidget);
+            headerBar = gtkHeaderBar;
+        }
+    }
+
+    private void configureUndecorated(String cssClass) {
+        gtkWindow.setDecorated(false);
+        gtkWindow.addCssClass(cssClass);
+        setWindowContent(containerWidget);
+    }
+
+    /** The content under the window controls, at the start and the end of its top. */
+    private void configureExtended() {
+        if (!(gtkWindow instanceof AdwWindow)) {
+            // An empty titlebar keeps the client-side shadow and resize area
+            // without a visible header
+            GtkBox titlebar = GtkBox.create(Gtk.ORIENTATION_HORIZONTAL, 0);
+            titlebar.setVisible(false);
+            gtkWindow.setTitlebar(titlebar);
+        }
+        GtkOverlay overlay = GtkOverlay.create();
+        overlay.setChild(containerWidget);
+        GtkWindowControls start = GtkWindowControls.create(Gtk.PACK_START);
+        overlay.addOverlay(headerControls(start, Gtk.ALIGN_START));
+        GtkWindowControls end = GtkWindowControls.create(Gtk.PACK_END);
+        overlay.addOverlay(headerControls(end, Gtk.ALIGN_END));
+        nativeHeaderControlsStart = start;
+        nativeHeaderControlsEnd = end;
+        applyNativeHeaderControlsPreferences();
+        setWindowContent(overlay);
     }
 
     /**
@@ -517,19 +515,36 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         if (testTag != null) {
             Gtk4TestSession.cancelPlacement(this);
         }
-
         windowMap.remove(ptr);
+        releaseFocusAndGrab();
+        destroyChildren();
+        disconnectSignals();
+        if (compositor != null) {
+            compositor.clearPaintable();
+        }
+        disposeBackgroundEffect();
+        destroyNativeWindow();
+        if (owner != null) {
+            owner.children.remove(this);
+        }
+        notifyDestroy();
+        releaseNativeResources();
+    }
+
+    /** Gives the focus back to the owner, as window managers do, and ends a grab of the window. */
+    private void releaseFocusAndGrab() {
         if (lastActiveWindow == this) {
             lastActiveWindow = null;
         }
         if (active && owner != null && owner.gtkWindow != null && owner.gtkWindow.getVisible()) {
-            // Return the focus to the owner, as window managers do
             owner.gtkWindow.present();
         }
         if (grabWindow == this) {
             releaseGrab();
         }
+    }
 
+    private void destroyChildren() {
         for (Gtk4Window child : new ArrayList<>(children)) {
             if (child.gtkWindow != null) {
                 child.gtkWindow.setTransientFor(null);
@@ -538,7 +553,9 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
             child.destroy();
         }
         children.clear();
+    }
 
+    private void disconnectSignals() {
         if (surfaceSignals != null) {
             surfaceSignals.disconnectAllSignals();
             surfaceSignals = null;
@@ -547,13 +564,14 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
             signals.disconnectAllSignals();
             signals.removeAllControllers();
         }
+    }
 
-        if (compositor != null) {
-            compositor.clearPaintable();
-        }
-
-        disposeBackgroundEffect();
-
+    /**
+     * Destroys the GTK window, or removes the popover, later when a press is
+     * being delivered to it (GTK grabs the pointer for its widget once the
+     * press is delivered), and the compositor of the frames.
+     */
+    private void destroyNativeWindow() {
         if (popover != null) {
             GtkPopover removed = popover;
             popover = null;
@@ -566,19 +584,14 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
             gtkWindow.destroy();
             gtkWindow = null;
         }
-
         if (compositor != null) {
             compositor.dispose();
             compositor = null;
         }
+    }
 
-        if (owner != null) {
-            owner.children.remove(this);
-        }
-
-        notifyDestroy();
-
-        // The arena holds the upcall stubs; no more signals can be delivered
+    /** The arena of the upcall stubs, once no more signals can be delivered, and the widgets. */
+    private void releaseNativeResources() {
         if (windowArena != null) {
             Gtk4Application.closeLater(windowArena);
             windowArena = null;
@@ -690,31 +703,40 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
             return;
         }
         active = isActive;
-        if (isActive) {
-            lastActiveWindow = this;
-            activatedSinceMap = true;
-            if (pendingMinimize) {
-                // The activation requested when the window was shown would
-                // otherwise restore it
-                pendingMinimize = false;
-                gtkWindow.minimize();
-                return;
-            }
+        if (isActive && activated()) {
+            return;
         }
         Gtk4Log.log(FOCUS, "onActiveChanged: active=%b enabled=%b", isActive, isEnabled());
-
         if (!isActive && grabWindow != null && !isAnyWindowActive()) {
             // The application lost the focus (e.g. a click outside its windows)
             grabWindow.releaseGrab();
         }
-
         if (isActive && minimized) {
             minimized = false;
             notifyResize(WindowEvent.RESTORE, windowWidth, windowHeight);
         }
-
         getCurrentView().ifPresent(v -> v.onWindowFocus(isActive));
+        notifyFocusChange(isActive);
+    }
 
+    /**
+     * Records an activation; a minimize asked while the window was shown
+     * happens now, as the activation requested at show would restore it.
+     *
+     * @return whether the window was minimized instead
+     */
+    private boolean activated() {
+        lastActiveWindow = this;
+        activatedSinceMap = true;
+        if (!pendingMinimize) {
+            return false;
+        }
+        pendingMinimize = false;
+        gtkWindow.minimize();
+        return true;
+    }
+
+    private void notifyFocusChange(boolean isActive) {
         if (hiding) {
             // As with GTK 3, where the focus out arrives after the window is
             // gone, a window that hides does not lose the focus: the scene
@@ -841,68 +863,72 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         if (destroyed || containerWidget == null) {
             return;
         }
-
         int vw = containerWidget.getWidth();
         int vh = containerWidget.getHeight();
-        int ww;
-        int wh;
-        int vx = 0;
-        int vy = 0;
-        if (isPopup()) {
-            ww = vw;
-            wh = vh;
-        } else {
-            ww = gtkWindow.getWidth();
-            wh = gtkWindow.getHeight();
-            double[] x = new double[1];
-            double[] y = new double[1];
-            if (containerWidget.translateCoordinates(gtkWindow, 0, 0, x, y)) {
-                vx = (int) Math.round(x[0]);
-                vy = (int) Math.round(y[0]);
-            }
-        }
-
+        int ww = isPopup() ? vw : gtkWindow.getWidth();
+        int wh = isPopup() ? vh : gtkWindow.getHeight();
         if (vw <= 0 || vh <= 0 || ww <= 0 || wh <= 0) {
             return;
         }
-
         if (isPopup()) {
             updatePopupPosition();
         } else if (usesNativeHeaderControls()) {
             updateNativeHeaderMetrics();
         }
-
-        if (vx != viewX || vy != viewY) {
-            viewX = vx;
-            viewY = vy;
-            Gtk4Log.log(SIZING, "updateGeometry: view position %d,%d", viewX, viewY);
-            if (currentView != null) {
-                currentView.notifyViewPosition(viewX, viewY);
-            }
-        }
-
-        if (ww != windowWidth || wh != windowHeight) {
-            windowWidth = ww;
-            windowHeight = wh;
-            floatingShown |= isFloating();
-            Gtk4Log.log(SIZING, "updateGeometry: window size %dx%d", ww, wh);
-            notifyWindowResize();
-            if (testTag != null && mapped && !isFloating()) {
-                // The compositor moved the window as it maximized it or made it
-                // full screen, which the state change may have reported too early
-                Gtk4TestSession.schedulePlacement(this);
-            }
-        }
-
-        if (vw != viewWidth || vh != viewHeight) {
-            viewWidth = vw;
-            viewHeight = vh;
-            Gtk4Log.log(SIZING, "updateGeometry: view size %dx%d", vw, vh);
-            notifyViewResize();
-            updateWindowConstraints();
-        }
-
+        int[] origin = isPopup() ? new int[2] : viewOrigin();
+        updateViewPosition(origin[0], origin[1]);
+        updateWindowSize(ww, wh);
+        updateViewSize(vw, vh);
         updateBlurRegion();
+    }
+
+    /** Where the view is in the toplevel, below its header bar. */
+    private int[] viewOrigin() {
+        double[] x = new double[1];
+        double[] y = new double[1];
+        if (containerWidget.translateCoordinates(gtkWindow, 0, 0, x, y)) {
+            return new int[] {(int) Math.round(x[0]), (int) Math.round(y[0])};
+        }
+        return new int[2];
+    }
+
+    private void updateViewPosition(int x, int y) {
+        if (x == viewX && y == viewY) {
+            return;
+        }
+        viewX = x;
+        viewY = y;
+        Gtk4Log.log(SIZING, "updateGeometry: view position %d,%d", viewX, viewY);
+        if (currentView != null) {
+            currentView.notifyViewPosition(viewX, viewY);
+        }
+    }
+
+    private void updateWindowSize(int width, int height) {
+        if (width == windowWidth && height == windowHeight) {
+            return;
+        }
+        windowWidth = width;
+        windowHeight = height;
+        floatingShown |= isFloating();
+        Gtk4Log.log(SIZING, "updateGeometry: window size %dx%d", width, height);
+        notifyWindowResize();
+        if (testTag != null && mapped && !isFloating()) {
+            // The compositor moved the window as it maximized it or made it
+            // full screen, which the state change may have reported too early
+            Gtk4TestSession.schedulePlacement(this);
+        }
+    }
+
+    private void updateViewSize(int width, int height) {
+        if (width == viewWidth && height == viewHeight) {
+            return;
+        }
+        viewWidth = width;
+        viewHeight = height;
+        Gtk4Log.log(SIZING, "updateGeometry: view size %dx%d", width, height);
+        notifyViewResize();
+        updateWindowConstraints();
     }
 
     // ---------------------------------------------------------------------
@@ -1034,33 +1060,12 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         if (surface == null || owner == null || popover == null) {
             return;
         }
-        GdkPopup gdkPopup = surface.cast(GdkPopup::wrap);
-        GtkWidget ownerNative = owner.viewWidget != null ? owner.viewWidget.getNative().cast(GtkWidget::new) : null;
-        if (ownerNative == null) {
+        int[] placed = popupPlacement();
+        if (placed == null) {
             return;
         }
-        // The owner's view origin in its surface
-        double[] ox = new double[1];
-        double[] oy = new double[1];
-        if (!owner.containerWidget.translateCoordinates(ownerNative, 0, 0, ox, oy)) {
-            return;
-        }
-        double[] otx = new double[1];
-        double[] oty = new double[1];
-        ownerNative.cast(GtkNative::wrap).getSurfaceTransform(otx, oty);
-
-        // This popup's view origin in its surface
-        double[] px = new double[1];
-        double[] py = new double[1];
-        if (!containerWidget.translateCoordinates(popover, 0, 0, px, py)) {
-            return;
-        }
-        double[] ptx = new double[1];
-        double[] pty = new double[1];
-        popover.getSurfaceTransform(ptx, pty);
-
-        int x = (int) Math.round(gdkPopup.getPositionX() + ptx[0] + px[0] - otx[0] - ox[0]);
-        int y = (int) Math.round(gdkPopup.getPositionY() + pty[0] + py[0] - oty[0] - oy[0]);
+        int x = placed[0];
+        int y = placed[1];
         if (x == popupX && y == popupY) {
             popupPlacementChecked = true;
             return;
@@ -1078,6 +1083,40 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         popupX = x;
         popupY = y;
         notifyMove(getScreenX(), getScreenY());
+    }
+
+    /**
+     * Where the view of the popup is, relative to the view of its owner: the
+     * position of the popup surface, plus where each view is in its surface.
+     */
+    private int[] popupPlacement() {
+        GtkWidget ownerNative = owner.viewWidget != null ? owner.viewWidget.getNative().cast(GtkWidget::new) : null;
+        if (ownerNative == null) {
+            return null;
+        }
+        double[] ownerView = viewInSurface(owner.containerWidget, ownerNative, ownerNative.cast(GtkNative::wrap));
+        double[] popupView = viewInSurface(containerWidget, popover, popover);
+        if (ownerView == null || popupView == null) {
+            return null;
+        }
+        GdkPopup gdkPopup = surface.cast(GdkPopup::wrap);
+        return new int[] {
+            (int) Math.round(gdkPopup.getPositionX() + popupView[0] - ownerView[0]),
+            (int) Math.round(gdkPopup.getPositionY() + popupView[1] - ownerView[1])
+        };
+    }
+
+    /** The origin of a view in the surface of its native widget, or null. */
+    private static double[] viewInSurface(GtkWidget view, GtkWidget nativeWidget, GtkNative gtkNative) {
+        double[] x = new double[1];
+        double[] y = new double[1];
+        if (!view.translateCoordinates(nativeWidget, 0, 0, x, y)) {
+            return null;
+        }
+        double[] tx = new double[1];
+        double[] ty = new double[1];
+        gtkNative.getSurfaceTransform(tx, ty);
+        return new double[] {x[0] + tx[0], y[0] + ty[0]};
     }
 
     private void notifyWindowResize() {
@@ -1133,28 +1172,22 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         }
         int width = w > 0 ? w : cw;
         int height = h > 0 ? h : ch;
-        if (width > 0) {
-            popupWidth = width;
-        }
-        if (height > 0) {
-            popupHeight = height;
-        }
+        popupWidth = width > 0 ? width : popupWidth;
+        popupHeight = height > 0 ? height : popupHeight;
         Gtk4Log.log(POPUP, "setPopupBounds: %d,%d %dx%d", popupX, popupY, popupWidth, popupHeight);
-
-        if (popupWidth > 0 && popupHeight > 0
-                && (popupWidth != viewWidth || popupHeight != viewHeight)) {
+        boolean sized = popupWidth > 0 && popupHeight > 0;
+        if (sized && (popupWidth != viewWidth || popupHeight != viewHeight)) {
             windowWidth = viewWidth = popupWidth;
             windowHeight = viewHeight = popupHeight;
             notifyWindowResize();
             notifyViewResize();
         }
-
         if (xSet || ySet) {
             popupPlacementChecked = false;
             notifyMove(getScreenX(), getScreenY());
         }
         if (popover != null) {
-            if (popupWidth > 0 && popupHeight > 0) {
+            if (sized) {
                 contentLayout.setSize(popupWidth, popupHeight, popupWidth, popupHeight);
             }
             positionPopover();
@@ -1180,50 +1213,55 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         if (ySet && !echo) {
             preferredY = y;
         }
-
-        if ((xSet || ySet) && Gtk4TestSession.isEnabled()) {
-            positionRequested = true;
-            requestedX = xSet ? Integer.valueOf(x) : requestedX;
-            requestedY = ySet ? Integer.valueOf(y) : requestedY;
-            frameX = xSet ? x : frameX;
-            frameY = ySet ? y : frameY;
-            notifyMove(frameX, frameY);
-            if (mapped && testTag != null) {
-                Gtk4TestSession.schedulePlacement(this);
-            }
-        } else if (xSet || ySet) {
-            // Wayland clients cannot position their toplevels
-            originEchoPending = x != 0 || y != 0;
-            notifyMove(0, 0);
+        if (xSet || ySet) {
+            requestPosition(x, y, xSet, ySet);
         }
-
         if (mapped && !isFloating()) {
             // Report the current values back so Glass stays in sync
             notifyWindowResize();
             notifyViewResize();
             return;
         }
+        resizeToplevel(x, y, xSet, ySet, w, h, cw, ch);
+    }
 
+    /**
+     * Moves a toplevel in a test session; elsewhere Wayland clients cannot
+     * position their toplevels, which stay at the origin for Glass.
+     */
+    private void requestPosition(int x, int y, boolean xSet, boolean ySet) {
+        if (!Gtk4TestSession.isEnabled()) {
+            originEchoPending = x != 0 || y != 0;
+            notifyMove(0, 0);
+            return;
+        }
+        positionRequested = true;
+        requestedX = xSet ? Integer.valueOf(x) : requestedX;
+        requestedY = ySet ? Integer.valueOf(y) : requestedY;
+        frameX = xSet ? x : frameX;
+        frameY = ySet ? y : frameY;
+        notifyMove(frameX, frameY);
+        if (mapped && testTag != null) {
+            Gtk4TestSession.schedulePlacement(this);
+        }
+    }
+
+    /**
+     * Sets the default size of a floating toplevel from the window size, or
+     * from the content size plus the decorations, within the size limits.
+     */
+    private void resizeToplevel(int x, int y, boolean xSet, boolean ySet, int w, int h, int cw, int ch) {
         int decorationWidth = decorationWidth();
         int decorationHeight = decorationHeight();
-
         // The default size is the size of the window (including the header bar)
         int newW = w > 0 ? w : (cw > 0 ? cw + decorationWidth : -1);
         int newH = h > 0 ? h : (ch > 0 ? ch + decorationHeight : -1);
         if (newW <= 0 && newH <= 0) {
             return;
         }
-
-        int[] current = new int[2];
-        int[] currentH = new int[1];
-        gtkWindow.getDefaultSize(current, currentH);
-        if (newW <= 0) {
-            newW = windowWidth > 0 ? windowWidth : current[0];
-        }
-        if (newH <= 0) {
-            newH = windowHeight > 0 ? windowHeight : currentH[0];
-        }
-
+        int[] current = currentDefaultSize();
+        newW = newW > 0 ? newW : current[0];
+        newH = newH > 0 ? newH : current[1];
         if (!mapped) {
             restoreX = xSet ? Integer.valueOf(x) : restoreX;
             restoreY = ySet ? Integer.valueOf(y) : restoreY;
@@ -1233,21 +1271,39 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         Gtk4Log.log(SIZING, "setToplevelBounds: default size %dx%d", clampedW, clampedH);
         int contentW = cw > 0 && clampedW == newW ? cw : clampedW - decorationWidth;
         int contentH = ch > 0 && clampedH == newH ? ch : clampedH - decorationHeight;
-        newW = clampedW;
-        newH = clampedH;
+        applyDefaultSize(clampedW, clampedH, contentW, contentH);
+    }
+
+    /** The size of the window, or else its default size. */
+    private int[] currentDefaultSize() {
+        int[] width = new int[1];
+        int[] height = new int[1];
+        gtkWindow.getDefaultSize(width, height);
+        return new int[] {windowWidth > 0 ? windowWidth : width[0], windowHeight > 0 ? windowHeight : height[0]};
+    }
+
+    private void applyDefaultSize(int width, int height, int contentW, int contentH) {
         if (!resizable || !isEnabled()) {
             // A fixed size window is sized to its content
             contentLayout.setSize(contentW, contentH, contentW, contentH);
         }
-        gtkWindow.setDefaultSize(newW, newH);
+        gtkWindow.setDefaultSize(width, height);
         if (!mapped) {
-            restoreWidth = newW;
-            restoreHeight = newH;
+            restoreWidth = width;
+            restoreHeight = height;
         }
         if (!mapped && !positionRequested && Gtk4TestSession.isEnabled()) {
-            placeCentered(newW, newH);
+            placeCentered(width, height);
         }
-        if (mapped && newW == windowWidth && newH == windowHeight) {
+        reportDefaultSize(width, height, contentW, contentH);
+    }
+
+    /**
+     * Reports a size that GTK will not report: the same as now, or one asked
+     * before the window is shown.
+     */
+    private void reportDefaultSize(int width, int height, int contentW, int contentH) {
+        if (mapped && width == windowWidth && height == windowHeight) {
             notifyWindowResize();
             notifyViewResize();
         }
@@ -1258,7 +1314,7 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
             // The compositor sizes the window once it shows: until then the
             // stage has the size asked for, as with the other platforms, which
             // applications such as FXGL read right after show()
-            notifyResize(WindowEvent.RESIZE, newW, newH);
+            notifyResize(WindowEvent.RESIZE, width, height);
         }
     }
 
@@ -1403,26 +1459,8 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
     protected boolean _setVisible(long ptr, boolean visible) {
         Gtk4Log.log(LIFECYCLE, "_setVisible: visible=%b", visible);
         if (isPopup()) {
-            if (popover == null) {
-                return false;
-            }
-            if (visible) {
-                positionPopover();
-                popover.popup();
-                Gtk4Accessible.windowShown(this);
-            } else if (Gtk4View.isDispatchingPress()) {
-                GtkPopover hidden = popover;
-                Application.invokeLater(() -> {
-                    if (popover == hidden && !isVisible()) {
-                        hidden.popdown();
-                    }
-                });
-            } else {
-                popover.popdown();
-            }
-            return visible;
+            return popover != null && setPopupVisible(visible);
         }
-
         if (gtkWindow == null) {
             return false;
         }
@@ -1445,6 +1483,29 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
         return visible;
     }
 
+    /**
+     * Pops the popover up or down; down later when a press is being
+     * delivered to it, as GTK grabs the pointer for its widget once the
+     * press is delivered.
+     */
+    private boolean setPopupVisible(boolean visible) {
+        if (visible) {
+            positionPopover();
+            popover.popup();
+            Gtk4Accessible.windowShown(this);
+        } else if (Gtk4View.isDispatchingPress()) {
+            GtkPopover hidden = popover;
+            Application.invokeLater(() -> {
+                if (popover == hidden && !isVisible()) {
+                    hidden.popdown();
+                }
+            });
+        } else {
+            popover.popdown();
+        }
+        return visible;
+    }
+
     @Override
     protected boolean _minimize(long ptr, boolean minimize) {
         if (gtkWindow == null) {
@@ -1454,30 +1515,39 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
             initialState = minimize
                     ? (initialState | INITIAL_STATE_ICONIFIED)
                     : (initialState & ~INITIAL_STATE_ICONIFIED);
-            return minimize;
-        }
-        if (minimize) {
-            if (!activatedSinceMap && gtkWindow.getVisible()) {
-                pendingMinimize = true;
-            } else {
-                gtkWindow.minimize();
-            }
-            // Wayland does not report the minimized state, so it is assumed
-            // until the window is activated again
-            if (!minimized) {
-                minimized = true;
-                notifyResize(WindowEvent.MINIMIZE, windowWidth, windowHeight);
-            }
+        } else if (minimize) {
+            minimizeMapped();
         } else {
-            pendingMinimize = false;
-            gtkWindow.unminimize();
-            activate();
-            if (minimized) {
-                minimized = false;
-                notifyResize(WindowEvent.RESTORE, windowWidth, windowHeight);
-            }
+            restoreMinimized();
         }
         return minimize;
+    }
+
+    /**
+     * Minimizes a shown window, after its first activation, which would
+     * restore it. Wayland does not report the minimized state, so it is
+     * assumed until the window is activated again.
+     */
+    private void minimizeMapped() {
+        if (!activatedSinceMap && gtkWindow.getVisible()) {
+            pendingMinimize = true;
+        } else {
+            gtkWindow.minimize();
+        }
+        if (!minimized) {
+            minimized = true;
+            notifyResize(WindowEvent.MINIMIZE, windowWidth, windowHeight);
+        }
+    }
+
+    private void restoreMinimized() {
+        pendingMinimize = false;
+        gtkWindow.unminimize();
+        activate();
+        if (minimized) {
+            minimized = false;
+            notifyResize(WindowEvent.RESTORE, windowWidth, windowHeight);
+        }
     }
 
     @Override
@@ -1875,41 +1945,54 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
                 || gtkWindow == null || gtkWindow.isFullscreen()) {
             return false;
         }
-
         int hitTest = nonClientHitTest(x, y);
         Gtk4Log.log(HEADERBAR, "handleExtendedButtonPress: button=%d nPress=%d at %.1f,%.1f hitTest=%d",
                 button, nPress, x, y, hitTest);
         if (nPress == 2 && button == Gdk.BUTTON_PRIMARY) {
-            if (resizable && hitTest == HT_CAPTION) {
-                if (gtkWindow.isMaximized()) {
-                    gtkWindow.unmaximize();
-                } else {
-                    _maximize(ptr, true, false);
-                }
-            }
-            return hitTest == HT_CAPTION;
+            return doubleClick(hitTest);
         }
         if (nPress != 1) {
             return false;
         }
+        if (button == Gdk.BUTTON_PRIMARY) {
+            return beginResizeOrMove(event, hitTest, x, y);
+        }
+        if (button == Gdk.BUTTON_SECONDARY && hitTest == HT_CAPTION) {
+            toplevel.showWindowMenu(event);
+            return true;
+        }
+        return false;
+    }
 
+    /** A double click on the caption maximizes or restores the window. */
+    private boolean doubleClick(int hitTest) {
+        if (resizable && hitTest == HT_CAPTION) {
+            if (gtkWindow.isMaximized()) {
+                gtkWindow.unmaximize();
+            } else {
+                _maximize(ptr, true, false);
+            }
+        }
+        return hitTest == HT_CAPTION;
+    }
+
+    /**
+     * A press on an edge resizes the window, and one on the caption moves it,
+     * through the compositor.
+     */
+    private boolean beginResizeOrMove(GdkEvent event, int hitTest, double x, double y) {
         GdkDevice device = event.getDevice();
         int time = event.getTime();
-        if (button == Gdk.BUTTON_PRIMARY) {
-            int edge = resizable && isFloating() ? getWindowEdge(x, y) : -1;
-            if (edge >= 0 && (edge != Gdk.SURFACE_EDGE_NORTH || hitTest != HT_CLIENT)) {
-                notifyFocusUngrab();
-                toplevel.beginResize(edge, device, button, x + viewX, y + viewY, time);
-                return true;
-            }
-            if (hitTest == HT_CAPTION) {
-                Gtk4Log.log(HEADERBAR, "beginMove: at %.1f,%.1f time=%d", x + viewX, y + viewY, time);
-                notifyFocusUngrab();
-                toplevel.beginMove(device, button, x + viewX, y + viewY, time);
-                return true;
-            }
-        } else if (button == Gdk.BUTTON_SECONDARY && hitTest == HT_CAPTION) {
-            toplevel.showWindowMenu(event);
+        int edge = resizable && isFloating() ? getWindowEdge(x, y) : -1;
+        if (edge >= 0 && (edge != Gdk.SURFACE_EDGE_NORTH || hitTest != HT_CLIENT)) {
+            notifyFocusUngrab();
+            toplevel.beginResize(edge, device, Gdk.BUTTON_PRIMARY, x + viewX, y + viewY, time);
+            return true;
+        }
+        if (hitTest == HT_CAPTION) {
+            Gtk4Log.log(HEADERBAR, "beginMove: at %.1f,%.1f time=%d", x + viewX, y + viewY, time);
+            notifyFocusUngrab();
+            toplevel.beginMove(device, Gdk.BUTTON_PRIMARY, x + viewX, y + viewY, time);
             return true;
         }
         return false;

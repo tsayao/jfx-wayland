@@ -172,32 +172,50 @@ public class Gtk4View extends View {
         this.window = window;
         this.viewWidget = viewWidget;
         this.signals = signals;
+        controllers[0] = addEventController();
+        controllers[1] = addMotionController();
+        GtkWidget keyWidget = window.isPopup() ? null : window.getKeyWidget();
+        if (keyWidget != null) {
+            controllers[2] = addKeyController(keyWidget);
+        }
+        controllers[3] = addDropTarget();
+        if (imEnabled) {
+            enableOrResetIME();
+        }
+    }
 
+    /** The pointer, touch and scroll events of the view. */
+    private GtkEventController addEventController() {
         GtkEventControllerLegacy legacy = GtkEventControllerLegacy.create();
         signals.addController(viewWidget, legacy);
         signals.connect(legacy, "event", this, "onEvent", int.class, GtkEventController.class, GdkEvent.class);
-        controllers[0] = legacy;
+        return legacy;
+    }
 
+    /** The pointer entering and leaving the view. */
+    private GtkEventController addMotionController() {
         GtkEventControllerMotion motion = GtkEventControllerMotion.create();
         signals.addController(viewWidget, motion);
         signals.connect(motion, "enter", this, "onEnter",
                 void.class, GtkEventController.class, double.class, double.class);
         signals.connect(motion, "leave", this, "onLeave", void.class, GtkEventController.class);
-        controllers[1] = motion;
+        return motion;
+    }
 
-        GtkWidget keyWidget = window.isPopup() ? null : window.getKeyWidget();
-        if (keyWidget != null) {
-            GtkEventControllerKey key = GtkEventControllerKey.create();
-            // Capture phase, so GTK key bindings (focus navigation, F10) do not run
-            key.setPropagationPhase(Gtk.PHASE_CAPTURE);
-            signals.addController(keyWidget, key);
-            signals.connect(key, "key-pressed", this, "onKeyPressed",
-                    int.class, GtkEventController.class, int.class, int.class, int.class);
-            signals.connect(key, "key-released", this, "onKeyReleased",
-                    void.class, GtkEventController.class, int.class, int.class, int.class);
-            controllers[2] = key;
-        }
+    /** The keys, in the capture phase, so GTK key bindings (focus navigation, F10) do not run. */
+    private GtkEventController addKeyController(GtkWidget keyWidget) {
+        GtkEventControllerKey key = GtkEventControllerKey.create();
+        key.setPropagationPhase(Gtk.PHASE_CAPTURE);
+        signals.addController(keyWidget, key);
+        signals.connect(key, "key-pressed", this, "onKeyPressed",
+                int.class, GtkEventController.class, int.class, int.class, int.class);
+        signals.connect(key, "key-released", this, "onKeyReleased",
+                void.class, GtkEventController.class, int.class, int.class, int.class);
+        return key;
+    }
 
+    /** The drops of drag and drop, with any action. */
+    private GtkEventController addDropTarget() {
         GtkDropTargetAsync dropTarget = GtkDropTargetAsync.create(null,
                 Gdk.ACTION_COPY | Gdk.ACTION_MOVE | Gdk.ACTION_LINK);
         signals.addController(viewWidget, dropTarget);
@@ -211,11 +229,7 @@ public class Gtk4View extends View {
                 void.class, GtkEventController.class, GdkDrop.class);
         signals.connect(dropTarget, "drop", this, "onDrop",
                 int.class, GtkEventController.class, GdkDrop.class, double.class, double.class);
-        controllers[3] = dropTarget;
-
-        if (imEnabled) {
-            enableOrResetIME();
-        }
+        return dropTarget;
     }
 
     void detach() {
@@ -263,8 +277,8 @@ public class Gtk4View extends View {
     void notifyMouseExitIfEntered() {
         if (mouseEntered) {
             exitPointer();
-            int xAbs = window != null ? window.getScreenX() + lastMouseX : lastMouseX;
-            int yAbs = window != null ? window.getScreenY() + lastMouseY : lastMouseY;
+            int xAbs = screenX(lastMouseX);
+            int yAbs = screenY(lastMouseY);
             notifyMouse(MouseEvent.EXIT, MouseEvent.BUTTON_NONE, lastMouseX, lastMouseY, xAbs, yAbs,
                     0, false, false);
         }
@@ -305,8 +319,7 @@ public class Gtk4View extends View {
 
     int onEvent(GtkEventController controller, GdkEvent event) {
         int type = event.getEventType();
-        if ((type == Gdk.BUTTON_PRESS || type == Gdk.BUTTON_RELEASE || type == Gdk.MOTION_NOTIFY
-                || type == Gdk.SCROLL) && Gtk4Robot.isPickEvent(event.getTime())) {
+        if (isPointerEvent(type) && Gtk4Robot.isPickEvent(event.getTime())) {
             // A click of the robot for the color picker of the desktop, which
             // was not shown yet: the application does not get it
             Gtk4Log.log(POINTER, "dropped an event of the color picker of the robot");
@@ -320,31 +333,39 @@ public class Gtk4View extends View {
             }
             return 1;
         }
+        return dispatchEvent(event, type) ? 1 : 0;
+    }
+
+    private static boolean isPointerEvent(int type) {
+        return type == Gdk.BUTTON_PRESS || type == Gdk.BUTTON_RELEASE || type == Gdk.MOTION_NOTIFY
+                || type == Gdk.SCROLL;
+    }
+
+    /** Sends an event to its handler; returns whether the view handles events of its type. */
+    private boolean dispatchEvent(GdkEvent event, int type) {
         switch (type) {
-            case Gdk.BUTTON_PRESS, Gdk.BUTTON_RELEASE -> {
+            case Gdk.BUTTON_PRESS, Gdk.BUTTON_RELEASE ->
                 processButton(event.cast(GdkButtonEvent::new), type == Gdk.BUTTON_PRESS);
-                return 1;
-            }
-            case Gdk.MOTION_NOTIFY -> {
-                processMotion(event);
-                return 1;
-            }
-            case Gdk.SCROLL -> {
-                processScroll(event.cast(GdkScrollEvent::new));
-                return 1;
-            }
-            case Gdk.TOUCH_BEGIN, Gdk.TOUCH_UPDATE, Gdk.TOUCH_END, Gdk.TOUCH_CANCEL -> {
+            case Gdk.MOTION_NOTIFY -> processMotion(event);
+            case Gdk.SCROLL -> processScroll(event.cast(GdkScrollEvent::new));
+            case Gdk.TOUCH_BEGIN, Gdk.TOUCH_UPDATE, Gdk.TOUCH_END, Gdk.TOUCH_CANCEL ->
                 processTouch(event.cast(GdkTouchEvent::new), type);
-                return 1;
-            }
-            case Gdk.TOUCHPAD_PINCH, Gdk.TOUCHPAD_SWIPE -> {
+            case Gdk.TOUCHPAD_PINCH, Gdk.TOUCHPAD_SWIPE ->
                 processTouchpad(event.cast(GdkTouchpadEvent::new), type);
-                return 1;
-            }
             default -> {
-                return 0;
+                return false;
             }
         }
+        return true;
+    }
+
+    /** The screen position of a point of the view. */
+    private int screenX(int x) {
+        return window != null ? window.getScreenX() + x : x;
+    }
+
+    private int screenY(int y) {
+        return window != null ? window.getScreenY() + y : y;
     }
 
     /**
@@ -369,28 +390,59 @@ public class Gtk4View extends View {
             return;
         }
         int button = event.getButton();
-        int x = (int) px[0];
-        int y = (int) py[0];
-        Gtk4Log.log(POINTER, "button: %s button=%d at (%d,%d)", press ? "PRESS" : "RELEASE", button, x, y);
-
-        if (press && window != null) {
-            lastPressedView = this;
-            lastPressX = px[0];
-            lastPressY = py[0];
-            if (viewWidget != null && !viewWidget.hasFocus()) {
-                viewWidget.grabFocus();
-            }
-            int nPress = consecutivePresses(event);
-            if (window.handleExtendedButtonPress(event, button, nPress, px[0], py[0])) {
-                suppressRelease = button == Gdk.BUTTON_PRIMARY && nPress == 1;
-                return;
-            }
-        } else if (!press && suppressRelease && button == Gdk.BUTTON_PRIMARY) {
-            suppressRelease = false;
+        Gtk4Log.log(POINTER, "button: %s button=%d at (%d,%d)", press ? "PRESS" : "RELEASE", button,
+                (int) px[0], (int) py[0]);
+        boolean handledByWindow = press ? handlePress(event, button, px[0], py[0]) : suppressedRelease(button);
+        if (handledByWindow) {
             return;
         }
+        // The event state is the state just before the event; Glass expects the
+        // state after it
+        int mask = buttonMask(button);
+        pressedButtonsMask = press ? pressedButtonsMask | mask : pressedButtonsMask & ~mask;
+        int state = (event.getModifierState() & ~MOUSE_BUTTONS_MASK) | pressedButtonsMask;
+        int glassButton = toGlassButton(button);
+        if (glassButton != MouseEvent.BUTTON_NONE) {
+            notifyButton(press, glassButton, (int) px[0], (int) py[0], Gtk4KeyMap.toGlassModifier(state),
+                    press && button == Gdk.BUTTON_SECONDARY);
+        }
+    }
 
-        int mask = switch (button) {
+    /**
+     * Records a press, which gives the view the focus.
+     *
+     * @return whether the window handled it, on the title area or the
+     *     resize border of an extended window
+     */
+    private boolean handlePress(GdkButtonEvent event, int button, double x, double y) {
+        if (window == null) {
+            return false;
+        }
+        lastPressedView = this;
+        lastPressX = x;
+        lastPressY = y;
+        if (viewWidget != null && !viewWidget.hasFocus()) {
+            viewWidget.grabFocus();
+        }
+        int nPress = consecutivePresses(event);
+        if (window.handleExtendedButtonPress(event, button, nPress, x, y)) {
+            suppressRelease = button == Gdk.BUTTON_PRIMARY && nPress == 1;
+            return true;
+        }
+        return false;
+    }
+
+    /** Whether a release ends a press that the window handled. */
+    private boolean suppressedRelease(int button) {
+        if (suppressRelease && button == Gdk.BUTTON_PRIMARY) {
+            suppressRelease = false;
+            return true;
+        }
+        return false;
+    }
+
+    private static int buttonMask(int button) {
+        return switch (button) {
             case 1 -> Gtk4KeyMap.GDK_BUTTON1_MASK;
             case 2 -> Gtk4KeyMap.GDK_BUTTON2_MASK;
             case 3 -> Gtk4KeyMap.GDK_BUTTON3_MASK;
@@ -398,34 +450,18 @@ public class Gtk4View extends View {
             case GDK_BUTTON_FORWARD -> Gtk4KeyMap.GDK_BUTTON5_MASK;
             default -> 0;
         };
+    }
 
-        // The event state is the state just before the event; Glass expects the
-        // state after it
-        int state = event.getModifierState() & ~MOUSE_BUTTONS_MASK;
-        if (press) {
-            pressedButtonsMask |= mask;
-        } else {
-            pressedButtonsMask &= ~mask;
-        }
-        state |= pressedButtonsMask;
-
-        int glassButton = toGlassButton(button);
-        if (glassButton == MouseEvent.BUTTON_NONE) {
-            return;
-        }
-
-        int xAbs = window != null ? window.getScreenX() + x : x;
-        int yAbs = window != null ? window.getScreenY() + y : y;
-        boolean popupTrigger = press && button == Gdk.BUTTON_SECONDARY;
+    /** Notifies a press or a release, and the context menu of a secondary press. */
+    private void notifyButton(boolean press, int glassButton, int x, int y, int modifiers, boolean popupTrigger) {
         if (press) {
             pressDispatchDepth++;
         }
         try {
-            notifyMouse(press ? MouseEvent.DOWN : MouseEvent.UP, glassButton, x, y, xAbs, yAbs,
-                    Gtk4KeyMap.toGlassModifier(state), popupTrigger, false);
-
+            notifyMouse(press ? MouseEvent.DOWN : MouseEvent.UP, glassButton, x, y, screenX(x), screenY(y),
+                    modifiers, popupTrigger, false);
             if (popupTrigger) {
-                notifyMenu(x, y, xAbs, yAbs, false);
+                notifyMenu(x, y, screenX(x), screenY(y), false);
             }
         } finally {
             if (press) {
@@ -483,45 +519,43 @@ public class Gtk4View extends View {
         int y = (int) py[0];
         lastMouseX = x;
         lastMouseY = y;
-
         int state = (event.getModifierState() & ~MOUSE_BUTTONS_MASK) | pressedButtonsMask;
         int modifiers = Gtk4KeyMap.toGlassModifier(state);
-        int xAbs = window != null ? window.getScreenX() + x : x;
-        int yAbs = window != null ? window.getScreenY() + y : y;
-
         if (window != null && pressedButtonsMask == 0 && !window.updateExtendedCursor(px[0], py[0])) {
             // On the resize border of an extended window, which is not client area
             if (mouseEntered) {
                 exitPointer();
-                notifyMouse(MouseEvent.EXIT, MouseEvent.BUTTON_NONE, x, y, xAbs, yAbs, modifiers, false, false);
+                notifyMouse(MouseEvent.EXIT, MouseEvent.BUTTON_NONE, x, y, screenX(x), screenY(y), modifiers,
+                        false, false);
             }
             return;
         }
         if (!mouseEntered && pressedButtonsMask == 0) {
             enterPointer();
-            notifyMouse(MouseEvent.ENTER, MouseEvent.BUTTON_NONE, x, y, xAbs, yAbs, modifiers, false, false);
+            notifyMouse(MouseEvent.ENTER, MouseEvent.BUTTON_NONE, x, y, screenX(x), screenY(y), modifiers,
+                    false, false);
         }
-
-        boolean isDrag = (modifiers & (KeyEvent.MODIFIER_BUTTON_PRIMARY | KeyEvent.MODIFIER_BUTTON_MIDDLE
-                | KeyEvent.MODIFIER_BUTTON_SECONDARY | KeyEvent.MODIFIER_BUTTON_BACK
-                | KeyEvent.MODIFIER_BUTTON_FORWARD)) != 0;
-
-        int button = MouseEvent.BUTTON_NONE;
-        if ((modifiers & KeyEvent.MODIFIER_BUTTON_PRIMARY) != 0) {
-            button = MouseEvent.BUTTON_LEFT;
-        } else if ((modifiers & KeyEvent.MODIFIER_BUTTON_MIDDLE) != 0) {
-            button = MouseEvent.BUTTON_OTHER;
-        } else if ((modifiers & KeyEvent.MODIFIER_BUTTON_SECONDARY) != 0) {
-            button = MouseEvent.BUTTON_RIGHT;
-        } else if ((modifiers & KeyEvent.MODIFIER_BUTTON_BACK) != 0) {
-            button = MouseEvent.BUTTON_BACK;
-        } else if ((modifiers & KeyEvent.MODIFIER_BUTTON_FORWARD) != 0) {
-            button = MouseEvent.BUTTON_FORWARD;
-        }
-
+        int button = draggedButton(modifiers);
+        boolean isDrag = button != MouseEvent.BUTTON_NONE;
         Gtk4Log.log(POINTER_MOTION, "motion: (%d,%d) drag=%b", x, y, isDrag);
-        notifyMouse(isDrag ? MouseEvent.DRAG : MouseEvent.MOVE, button, x, y, xAbs, yAbs,
+        notifyMouse(isDrag ? MouseEvent.DRAG : MouseEvent.MOVE, button, x, y, screenX(x), screenY(y),
                 modifiers, false, false);
+    }
+
+    /** The first button held during a motion, which makes it a drag, or BUTTON_NONE. */
+    private static int draggedButton(int modifiers) {
+        if ((modifiers & KeyEvent.MODIFIER_BUTTON_PRIMARY) != 0) {
+            return MouseEvent.BUTTON_LEFT;
+        } else if ((modifiers & KeyEvent.MODIFIER_BUTTON_MIDDLE) != 0) {
+            return MouseEvent.BUTTON_OTHER;
+        } else if ((modifiers & KeyEvent.MODIFIER_BUTTON_SECONDARY) != 0) {
+            return MouseEvent.BUTTON_RIGHT;
+        } else if ((modifiers & KeyEvent.MODIFIER_BUTTON_BACK) != 0) {
+            return MouseEvent.BUTTON_BACK;
+        } else if ((modifiers & KeyEvent.MODIFIER_BUTTON_FORWARD) != 0) {
+            return MouseEvent.BUTTON_FORWARD;
+        }
+        return MouseEvent.BUTTON_NONE;
     }
 
     private void processTouch(GdkTouchEvent event, int type) {
@@ -533,18 +567,21 @@ public class Gtk4View extends View {
         }
         int x = (int) px[0];
         int y = (int) py[0];
-        int xAbs = window != null ? window.getScreenX() + x : x;
-        int yAbs = window != null ? window.getScreenY() + y : y;
         int state = event.getModifierState() & ~MOUSE_BUTTONS_MASK;
         Gtk4Log.log(POINTER, "touch: type=%d sequence=%x at (%d,%d) emulating=%b",
                 type, sequence.getPointer().address(), x, y, event.getEmulatingPointer());
-
-        Gtk4GestureSupport.touch(this, type, sequence.getPointer().address(), x, y, xAbs, yAbs,
+        Gtk4GestureSupport.touch(this, type, sequence.getPointer().address(), x, y, screenX(x), screenY(y),
                 Gtk4KeyMap.toGlassModifier(state));
-
-        if (!event.getEmulatingPointer()) {
-            return;
+        if (event.getEmulatingPointer()) {
+            emulatePointer(type, x, y, state);
         }
+    }
+
+    /**
+     * The mouse events of the touch that emulates the pointer: enter and
+     * press when it begins, drag when it moves, release and exit when it ends.
+     */
+    private void emulatePointer(int type, int x, int y, int state) {
         lastMouseX = x;
         lastMouseY = y;
         switch (type) {
@@ -555,22 +592,22 @@ public class Gtk4View extends View {
                 lastPressedView = this;
                 pressedButtonsMask |= Gtk4KeyMap.GDK_BUTTON1_MASK;
                 enterPointer();
-                notifyMouse(MouseEvent.ENTER, MouseEvent.BUTTON_NONE, x, y, xAbs, yAbs,
-                        Gtk4KeyMap.toGlassModifier(state), false, true);
-                notifyMouse(MouseEvent.DOWN, MouseEvent.BUTTON_LEFT, x, y, xAbs, yAbs,
-                        Gtk4KeyMap.toGlassModifier(state | pressedButtonsMask), false, true);
+                notifyTouchMouse(MouseEvent.ENTER, MouseEvent.BUTTON_NONE, x, y, state);
+                notifyTouchMouse(MouseEvent.DOWN, MouseEvent.BUTTON_LEFT, x, y, state | pressedButtonsMask);
             }
-            case Gdk.TOUCH_UPDATE -> notifyMouse(MouseEvent.DRAG, MouseEvent.BUTTON_LEFT, x, y, xAbs, yAbs,
-                    Gtk4KeyMap.toGlassModifier(state | pressedButtonsMask), false, true);
+            case Gdk.TOUCH_UPDATE ->
+                notifyTouchMouse(MouseEvent.DRAG, MouseEvent.BUTTON_LEFT, x, y, state | pressedButtonsMask);
             default -> {
                 pressedButtonsMask &= ~Gtk4KeyMap.GDK_BUTTON1_MASK;
-                notifyMouse(MouseEvent.UP, MouseEvent.BUTTON_LEFT, x, y, xAbs, yAbs,
-                        Gtk4KeyMap.toGlassModifier(state | pressedButtonsMask), false, true);
-                notifyMouse(MouseEvent.EXIT, MouseEvent.BUTTON_NONE, x, y, xAbs, yAbs,
-                        Gtk4KeyMap.toGlassModifier(state | pressedButtonsMask), false, true);
+                notifyTouchMouse(MouseEvent.UP, MouseEvent.BUTTON_LEFT, x, y, state | pressedButtonsMask);
+                notifyTouchMouse(MouseEvent.EXIT, MouseEvent.BUTTON_NONE, x, y, state | pressedButtonsMask);
                 exitPointer();
             }
         }
+    }
+
+    private void notifyTouchMouse(int type, int button, int x, int y, int state) {
+        notifyMouse(type, button, x, y, screenX(x), screenY(y), Gtk4KeyMap.toGlassModifier(state), false, true);
     }
 
     private void processTouchpad(GdkTouchpadEvent event, int type) {
@@ -582,8 +619,8 @@ public class Gtk4View extends View {
             x = (int) px[0];
             y = (int) py[0];
         }
-        int xAbs = window != null ? window.getScreenX() + x : x;
-        int yAbs = window != null ? window.getScreenY() + y : y;
+        int xAbs = screenX(x);
+        int yAbs = screenY(y);
         int modifiers = Gtk4KeyMap.toGlassModifier(event.getModifierState() & ~MOUSE_BUTTONS_MASK);
         int phase = event.getGesturePhase();
         if (type == Gdk.TOUCHPAD_PINCH) {
@@ -602,40 +639,10 @@ public class Gtk4View extends View {
     }
 
     private void processScroll(GdkScrollEvent event) {
-        double dx = 0;
-        double dy = 0;
-        double multiplier = 40.0;
-        int direction = event.getDirection();
-        switch (direction) {
-            case Gdk.SCROLL_UP -> dy = 1;
-            case Gdk.SCROLL_DOWN -> dy = -1;
-            case Gdk.SCROLL_LEFT -> dx = 1;
-            case Gdk.SCROLL_RIGHT -> dx = -1;
-            case Gdk.SCROLL_SMOOTH -> {
-                double[] deltaX = new double[1];
-                double[] deltaY = new double[1];
-                event.getDeltas(deltaX, deltaY);
-                dx = -deltaX[0];
-                dy = -deltaY[0];
-                if (event.getUnit() == Gdk.SCROLL_UNIT_SURFACE) {
-                    // Touchpads report logical pixels
-                    multiplier = 1.0;
-                }
-            }
-            default -> {
-            }
-        }
-
-        int state = event.getModifierState();
-        if (direction != Gdk.SCROLL_SMOOTH && (state & Gtk4KeyMap.GDK_SHIFT_MASK) != 0) {
-            double t = dy;
-            dy = dx;
-            dx = t;
-        }
-        if (dx == 0 && dy == 0) {
+        ScrollDelta delta = scrollDelta(event);
+        if (delta.dx() == 0 && delta.dy() == 0) {
             return;
         }
-
         double[] px = new double[1];
         double[] py = new double[1];
         int x = lastMouseX;
@@ -644,11 +651,41 @@ public class Gtk4View extends View {
             x = (int) px[0];
             y = (int) py[0];
         }
-        int xAbs = window != null ? window.getScreenX() + x : x;
-        int yAbs = window != null ? window.getScreenY() + y : y;
-        Gtk4Log.log(POINTER, "scroll: dx=%.2f dy=%.2f multiplier=%.0f", dx, dy, multiplier);
-        notifyScroll(x, y, xAbs, yAbs, dx, dy, Gtk4KeyMap.toGlassModifier(state),
-                0, 0, 0, 0, multiplier, multiplier);
+        Gtk4Log.log(POINTER, "scroll: dx=%.2f dy=%.2f multiplier=%.0f", delta.dx(), delta.dy(), delta.multiplier());
+        notifyScroll(x, y, screenX(x), screenY(y), delta.dx(), delta.dy(),
+                Gtk4KeyMap.toGlassModifier(event.getModifierState()),
+                0, 0, 0, 0, delta.multiplier(), delta.multiplier());
+    }
+
+    /** A scroll in wheel steps (40 pixels each) or, for touchpads, in pixels. */
+    private record ScrollDelta(double dx, double dy, double multiplier) {
+        ScrollDelta swapped() {
+            return new ScrollDelta(dy, dx, multiplier);
+        }
+    }
+
+    /** The scroll of an event; Shift makes the steps of a wheel horizontal. */
+    private static ScrollDelta scrollDelta(GdkScrollEvent event) {
+        int direction = event.getDirection();
+        ScrollDelta delta = switch (direction) {
+            case Gdk.SCROLL_UP -> new ScrollDelta(0, 1, 40.0);
+            case Gdk.SCROLL_DOWN -> new ScrollDelta(0, -1, 40.0);
+            case Gdk.SCROLL_LEFT -> new ScrollDelta(1, 0, 40.0);
+            case Gdk.SCROLL_RIGHT -> new ScrollDelta(-1, 0, 40.0);
+            case Gdk.SCROLL_SMOOTH -> smoothDelta(event);
+            default -> new ScrollDelta(0, 0, 40.0);
+        };
+        boolean shift = (event.getModifierState() & Gtk4KeyMap.GDK_SHIFT_MASK) != 0;
+        return direction != Gdk.SCROLL_SMOOTH && shift ? delta.swapped() : delta;
+    }
+
+    private static ScrollDelta smoothDelta(GdkScrollEvent event) {
+        double[] deltaX = new double[1];
+        double[] deltaY = new double[1];
+        event.getDeltas(deltaX, deltaY);
+        // Touchpads report logical pixels
+        double multiplier = event.getUnit() == Gdk.SCROLL_UNIT_SURFACE ? 1.0 : 40.0;
+        return new ScrollDelta(-deltaX[0], -deltaY[0], multiplier);
     }
 
     void onEnter(GtkEventController controller, double x, double y) {
@@ -670,8 +707,8 @@ public class Gtk4View extends View {
         GdkEvent event = controller.getCurrentEvent();
         // Workaround for JDK-8126843: the entering pointer has no buttons pressed
         int state = event.isNull() ? 0 : event.getModifierState() & ~MOUSE_BUTTONS_MASK;
-        int xAbs = window != null ? window.getScreenX() + ix : ix;
-        int yAbs = window != null ? window.getScreenY() + iy : iy;
+        int xAbs = screenX(ix);
+        int yAbs = screenY(iy);
         Gtk4Log.log(POINTER_MOTION, "enter: (%d,%d)", ix, iy);
         notifyMouse(MouseEvent.ENTER, MouseEvent.BUTTON_NONE, ix, iy, xAbs, yAbs,
                 Gtk4KeyMap.toGlassModifier(state), false, false);
@@ -684,8 +721,8 @@ public class Gtk4View extends View {
         exitPointer();
         GdkEvent event = controller.getCurrentEvent();
         int state = event.isNull() ? 0 : event.getModifierState();
-        int xAbs = window != null ? window.getScreenX() + lastMouseX : lastMouseX;
-        int yAbs = window != null ? window.getScreenY() + lastMouseY : lastMouseY;
+        int xAbs = screenX(lastMouseX);
+        int yAbs = screenY(lastMouseY);
         Gtk4Log.log(POINTER_MOTION, "leave: (%d,%d)", lastMouseX, lastMouseY);
         notifyMouse(MouseEvent.EXIT, MouseEvent.BUTTON_NONE, lastMouseX, lastMouseY, xAbs, yAbs,
                 Gtk4KeyMap.toGlassModifier(state), false, false);
@@ -743,8 +780,8 @@ public class Gtk4View extends View {
     private int dragOver(GdkDrop drop, double x, double y, boolean enter) {
         int ix = (int) x;
         int iy = (int) y;
-        int xAbs = window != null ? window.getScreenX() + ix : ix;
-        int yAbs = window != null ? window.getScreenY() + iy : iy;
+        int xAbs = screenX(ix);
+        int yAbs = screenY(iy);
         int available = Gtk4DnD.toGlassAction(drop.getActions());
         int recommended = Gtk4DnD.recommendedAction(drop.getActions());
         int result = enter
@@ -767,8 +804,8 @@ public class Gtk4View extends View {
         Gtk4DnD.drop(drop);
         int ix = (int) x;
         int iy = (int) y;
-        int xAbs = window != null ? window.getScreenX() + ix : ix;
-        int yAbs = window != null ? window.getScreenY() + iy : iy;
+        int xAbs = screenX(ix);
+        int yAbs = screenY(iy);
         try {
             int available = Gtk4DnD.toGlassAction(drop.getActions());
             int result = notifyDragDrop(ix, iy, xAbs, yAbs, Gtk4DnD.recommendedAction(drop.getActions()));
