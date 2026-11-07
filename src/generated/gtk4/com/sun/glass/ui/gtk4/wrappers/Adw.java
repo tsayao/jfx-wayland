@@ -25,6 +25,7 @@
 
 package com.sun.glass.ui.gtk4.wrappers;
 
+import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -39,11 +40,11 @@ public final class Adw {
 
     public static final int MAJOR_VERSION = 1;
 
-    public static final int MICRO_VERSION = 4;
+    public static final int MICRO_VERSION = 0;
 
-    public static final int MINOR_VERSION = 9;
+    public static final int MINOR_VERSION = 10;
 
-    public static final String VERSION_S = "1.9.4";
+    public static final String VERSION_S = "1.10.0";
 
     public static final int ACCENT_COLOR_BLUE = 0;
 
@@ -275,6 +276,18 @@ public final class Adw {
         }
     }
 
+    public static GObject bindPropertyToCssClass(GObject source, String source_property, GtkWidget target, String target_css_class, int flags) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment _r;
+            try {
+                _r = (MemorySegment) H.BIND_PROPERTY_TO_CSS_CLASS.get().invokeExact((MemorySegment) (source != null ? source.getPointer() : MemorySegment.NULL), (MemorySegment) (source_property != null ? arena.allocateFrom(source_property) : MemorySegment.NULL), (MemorySegment) (target != null ? target.getPointer() : MemorySegment.NULL), (MemorySegment) (target_css_class != null ? arena.allocateFrom(target_css_class) : MemorySegment.NULL), flags);
+            } catch (Throwable _t) {
+                throw rethrow(_t);
+            }
+            return new GObject(_r != null ? _r : MemorySegment.NULL);
+        }
+    }
+
     public static double easingEase(int self, double value) {
         try {
             return (double) H.EASING_EASE.get().invokeExact(self, value);
@@ -368,6 +381,8 @@ public final class Adw {
                 FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
         static final LazyHandle ACCENT_COLOR_TO_STANDALONE_RGBA = new LazyHandle("adw_accent_color_to_standalone_rgba",
                 FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        static final LazyHandle BIND_PROPERTY_TO_CSS_CLASS = new LazyHandle("adw_bind_property_to_css_class",
+                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
         static final LazyHandle EASING_EASE = new LazyHandle("adw_easing_ease",
                 FunctionDescriptor.of(ValueLayout.JAVA_DOUBLE, ValueLayout.JAVA_INT, ValueLayout.JAVA_DOUBLE));
         static final LazyHandle GET_ENABLE_ANIMATIONS = new LazyHandle("adw_get_enable_animations",

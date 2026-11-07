@@ -101,6 +101,16 @@ public class GtkIMContext extends GObject {
         }
     }
 
+    public GtkWidget getClientWidget() {
+        MemorySegment _r;
+        try {
+            _r = (MemorySegment) H.GET_CLIENT_WIDGET.get().invokeExact(ptr);
+        } catch (Throwable _t) {
+            throw rethrow(_t);
+        }
+        return new GtkWidget(_r != null ? _r : MemorySegment.NULL);
+    }
+
     public void getPreeditString(String[] str, MemorySegment attrs, int[] cursor_pos) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment _str = str != null ? arena.allocate(ValueLayout.ADDRESS) : MemorySegment.NULL;
@@ -216,6 +226,8 @@ public class GtkIMContext extends GObject {
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
         static final LazyHandle FOCUS_OUT = new LazyHandle("gtk_im_context_focus_out",
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+        static final LazyHandle GET_CLIENT_WIDGET = new LazyHandle("gtk_im_context_get_client_widget",
+                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
         static final LazyHandle GET_PREEDIT_STRING = new LazyHandle("gtk_im_context_get_preedit_string",
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
         static final LazyHandle GET_SURROUNDING = new LazyHandle("gtk_im_context_get_surrounding",

@@ -86,6 +86,14 @@ public class GUnixFDList extends GObject {
         }
     }
 
+    public long appendTake(int fd) {
+        try {
+            return (long) H.APPEND_TAKE.get().invokeExact(ptr, fd);
+        } catch (Throwable _t) {
+            throw rethrow(_t);
+        }
+    }
+
     public int get(int index_) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment _error = arena.allocate(ValueLayout.ADDRESS);
@@ -103,6 +111,22 @@ public class GUnixFDList extends GObject {
     public int getLength() {
         try {
             return (int) H.GET_LENGTH.get().invokeExact(ptr);
+        } catch (Throwable _t) {
+            throw rethrow(_t);
+        }
+    }
+
+    public int lookup(long index_) {
+        try {
+            return (int) H.LOOKUP.get().invokeExact(ptr, index_);
+        } catch (Throwable _t) {
+            throw rethrow(_t);
+        }
+    }
+
+    public int peek(long index_) {
+        try {
+            return (int) H.PEEK.get().invokeExact(ptr, index_);
         } catch (Throwable _t) {
             throw rethrow(_t);
         }
@@ -145,10 +169,16 @@ public class GUnixFDList extends GObject {
                 FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
         static final LazyHandle APPEND = new LazyHandle("g_unix_fd_list_append",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        static final LazyHandle APPEND_TAKE = new LazyHandle("g_unix_fd_list_append_take",
+                FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
         static final LazyHandle GET = new LazyHandle("g_unix_fd_list_get",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
         static final LazyHandle GET_LENGTH = new LazyHandle("g_unix_fd_list_get_length",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        static final LazyHandle LOOKUP = new LazyHandle("g_unix_fd_list_lookup",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+        static final LazyHandle PEEK = new LazyHandle("g_unix_fd_list_peek",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
         static final LazyHandle PEEK_FDS = new LazyHandle("g_unix_fd_list_peek_fds",
                 FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
         static final LazyHandle STEAL_FDS = new LazyHandle("g_unix_fd_list_steal_fds",

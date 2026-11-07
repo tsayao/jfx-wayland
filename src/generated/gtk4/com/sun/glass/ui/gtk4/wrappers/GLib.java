@@ -192,13 +192,13 @@ public final class GLib {
 
     public static final long MAXUINT64 = -1L;
 
-    public static final int MICRO_VERSION = 3;
+    public static final int MICRO_VERSION = 1;
 
     public static final int MININT32 = -2147483648;
 
     public static final long MININT64 = -9223372036854775808L;
 
-    public static final int MINOR_VERSION = 88;
+    public static final int MINOR_VERSION = 90;
 
     public static final String MODULE_SUFFIX = "so";
 
@@ -1392,7 +1392,9 @@ public final class GLib {
 
     public static final int G_USER_DIRECTORY_VIDEOS = 7;
 
-    public static final int G_USER_N_DIRECTORIES = 8;
+    public static final int G_USER_DIRECTORY_PROJECTS = 8;
+
+    public static final int G_USER_N_DIRECTORIES = 9;
 
     public static final int G_VARIANT_CLASS_BOOLEAN = 98;
 

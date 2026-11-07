@@ -111,13 +111,13 @@ public final class Gtk {
 
     public static final int ACCESSIBLE_VALUE_UNDEFINED = -1;
 
-    public static final int BINARY_AGE = 2205;
+    public static final int BINARY_AGE = 2401;
 
     public static final String IM_MODULE_EXTENSION_POINT_NAME = "gtk-im-module";
 
     public static final int INPUT_ERROR = -1;
 
-    public static final int INTERFACE_AGE = 5;
+    public static final int INTERFACE_AGE = 1;
 
     public static final int INVALID_LIST_POSITION = 0xFFFFFFFF;
 
@@ -133,9 +133,9 @@ public final class Gtk {
 
     public static final String MEDIA_FILE_EXTENSION_POINT_NAME = "gtk-media-file";
 
-    public static final int MICRO_VERSION = 5;
+    public static final int MICRO_VERSION = 1;
 
-    public static final int MINOR_VERSION = 22;
+    public static final int MINOR_VERSION = 24;
 
     public static final String PAPER_NAME_A3 = "iso_a3";
 
@@ -791,7 +791,11 @@ public final class Gtk {
 
     public static final int EDITABLE_PROP_ENABLE_UNDO = 7;
 
-    public static final int EDITABLE_NUM_PROPERTIES = 8;
+    public static final int EDITABLE_PROP_COMPLETE_TEXT = 8;
+
+    public static final int EDITABLE_PROP_INPUT_INTERCEPTOR = 9;
+
+    public static final int EDITABLE_NUM_PROPERTIES = 10;
 
     public static final int ENTRY_ICON_PRIMARY = 0;
 
@@ -1415,6 +1419,8 @@ public final class Gtk {
 
     public static final int SVG_ERROR_NOT_IMPLEMENTED = 9;
 
+    public static final int SVG_ERROR_FEATURE_DISABLED = 10;
+
     public static final int SYMBOLIC_COLOR_FOREGROUND = 0;
 
     public static final int SYMBOLIC_COLOR_ERROR = 1;
@@ -1562,6 +1568,8 @@ public final class Gtk {
     public static final int DEBUG_BUILDER = 2097152;
 
     public static final int DEBUG_SESSION = 4194304;
+
+    public static final int DEBUG_GENERAL_INFO = 8388608;
 
     public static final int EVENT_CONTROLLER_SCROLL_NONE = 0;
 

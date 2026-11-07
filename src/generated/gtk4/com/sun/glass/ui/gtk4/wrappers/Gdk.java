@@ -5104,6 +5104,20 @@ public final class Gdk {
 
     public static final int EVENT_LAST = 30;
 
+    public static final int FRAME_PREPARING = 0;
+
+    public static final int FRAME_SKIPPED = 1;
+
+    public static final int FRAME_EMPTY = 2;
+
+    public static final int FRAME_SUBMITTED = 3;
+
+    public static final int FRAME_OUTSTANDING = 4;
+
+    public static final int FRAME_DISCARDED = 5;
+
+    public static final int FRAME_PRESENTED = 6;
+
     public static final int FULLSCREEN_ON_CURRENT_MONITOR = 0;
 
     public static final int FULLSCREEN_ON_ALL_MONITORS = 1;
@@ -5288,7 +5302,19 @@ public final class Gdk {
 
     public static final int MEMORY_G16_B16_R16_444 = 64;
 
-    public static final int MEMORY_N_FORMATS = 65;
+    public static final int MEMORY_ARGB2101010_PREMULTIPLIED = 65;
+
+    public static final int MEMORY_ARGB2101010 = 66;
+
+    public static final int MEMORY_XRGB2101010 = 67;
+
+    public static final int MEMORY_ABGR2101010_PREMULTIPLIED = 68;
+
+    public static final int MEMORY_ABGR2101010 = 69;
+
+    public static final int MEMORY_XBGR2101010 = 70;
+
+    public static final int MEMORY_N_FORMATS = 71;
 
     public static final int NOTIFY_ANCESTOR = 0;
 
@@ -5774,6 +5800,20 @@ public final class Gdk {
         }
     }
 
+    public static MemorySegment keyvalGetAliases(int keyval, int[] n_aliases) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment _n_aliases = n_aliases != null ? arena.allocate(ValueLayout.JAVA_INT) : MemorySegment.NULL;
+            MemorySegment _r;
+            try {
+                _r = (MemorySegment) H.KEYVAL_GET_ALIASES.get().invokeExact(keyval, _n_aliases);
+            } catch (Throwable _t) {
+                throw rethrow(_t);
+            }
+            if (n_aliases != null && n_aliases.length > 0) n_aliases[0] = _n_aliases.get(ValueLayout.JAVA_INT, 0L);
+            return _r;
+        }
+    }
+
     public static boolean keyvalIsLower(int keyval) {
         try {
             return (int) H.KEYVAL_IS_LOWER.get().invokeExact(keyval) != 0;
@@ -5929,6 +5969,8 @@ public final class Gdk {
                 FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
         static final LazyHandle KEYVAL_FROM_NAME = new LazyHandle("gdk_keyval_from_name",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        static final LazyHandle KEYVAL_GET_ALIASES = new LazyHandle("gdk_keyval_get_aliases",
+                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
         static final LazyHandle KEYVAL_IS_LOWER = new LazyHandle("gdk_keyval_is_lower",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
         static final LazyHandle KEYVAL_IS_UPPER = new LazyHandle("gdk_keyval_is_upper",
