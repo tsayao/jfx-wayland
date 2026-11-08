@@ -53,9 +53,10 @@
 #   --compositor=gnome|kde|hyprland|none
 #                           nested compositor, or none for the current
 #                           desktop (none)
-#   --pipeline=auto|vk|gl|sw
-#                           Prism pipeline: Vulkan, OpenGL 4.5 or software;
-#                           auto tries them in that order (auto)
+#   --pipeline=auto|vk|gl|es2egl|sw
+#                           Prism pipeline: Vulkan, OpenGL 4.5, the ES2
+#                           pipeline on EGL or software; auto tries them in
+#                           that order (auto)
 #   --backdrop=auto|on|off  blur the area behind the windows; auto blurs it
 #                           (auto)
 #   --toolbox=NAME          toolbox container of the nested compositor
@@ -205,9 +206,9 @@ $TOOLBOX_PACKAGES" ;;
 
 validate_options() {
     case "$PIPELINE" in
-        auto) PRISM_ORDER=vk,gl,sw ;;
-        vk|gl|sw) PRISM_ORDER=$PIPELINE ;;
-        *) fail "Unknown pipeline: $PIPELINE (auto, vk, gl or sw)" ;;
+        auto) PRISM_ORDER=vk,gl,es2egl,sw ;;
+        vk|gl|es2egl|sw) PRISM_ORDER=$PIPELINE ;;
+        *) fail "Unknown pipeline: $PIPELINE (auto, vk, gl, es2egl or sw)" ;;
     esac
     case "$BACKDROP" in
         auto|on|off) ;;

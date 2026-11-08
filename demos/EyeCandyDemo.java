@@ -49,7 +49,7 @@ import java.util.logging.Logger;
 
 /**
  * The showcases of the Prism renderer in one window, chosen in the middle of
- * its header bar (or with Ctrl+1 to Ctrl+5):
+ * its header bar (or with Ctrl+1 to Ctrl+7):
  * <ul>
  * <li>Nebula: a planet with its moon, a galaxy and a nebula, in 3D;</li>
  * <li>Fractals: Mandelbrot and Julia sets computed in the background, and a
@@ -57,7 +57,9 @@ import java.util.logging.Logger;
  * <li>Fireworks: shells, salvos and smoke over a city, on canvases with a
  *     bloom;</li>
  * <li>Disco: a disco ball, dancers, beams and confetti;</li>
- * <li>Aurora: real-time 3D, charts and controls, in light and dark.</li>
+ * <li>Aurora: real-time 3D, charts and controls, in light and dark;</li>
+ * <li>Abyss: jellyfish, lanternfish and plankton that glow in the deep sea;</li>
+ * <li>Synthwave: a flight down a neon valley whose mountains dance to a beat.</li>
  * </ul>
  * -Deyecandy.show=fractals starts on a candy, and -Deyecandy.snapshot=file.png
  * saves a snapshot of the window after a few seconds and exits.
@@ -101,7 +103,9 @@ public class EyeCandyDemo extends Application {
             new Entry("Fractals", Fractals::new),
             new Entry("Fireworks", Fireworks::new),
             new Entry("Disco", Disco::new),
-            new Entry("Aurora", Aurora::new));
+            new Entry("Aurora", Aurora::new),
+            new Entry("Abyss", Abyss::new),
+            new Entry("Synthwave", Synthwave::new));
 
     private static final String CSS = """
         .candies {

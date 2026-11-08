@@ -10,8 +10,9 @@ JavaFX on Wayland.
 ## How it works
 
 The project is one jar for an unmodified JavaFX with a Glass on GTK 4 for
-Wayland (`-Dglass.platform=Gtk4`) and two Prism pipelines, Vulkan (`vk`) and
-OpenGL (`gl`). It is all Java: GTK, Vulkan, EGL and libei are called through
+Wayland (`-Dglass.platform=Gtk4`) and three Prism pipelines, Vulkan (`vk`),
+OpenGL (`gl`) and the ES2 pipeline of JavaFX on EGL (`es2egl`). It is all
+Java: GTK, Vulkan, EGL and libei are called through
 the Foreign Function & Memory API, with generated [bindings](#bindings).
 
 ### Bindings
@@ -37,7 +38,7 @@ generateBindings` regenerates them (see [Build](#build)).
 ### Rendering
 
 ```
-Prism (vk / gl) ──► dma-buf ──► GdkDmabufTexture ──► GtkGraphicsOffload ──► compositor
+Prism (vk / gl / es2egl) ──► dma-buf ──► GdkDmabufTexture ──► GtkGraphicsOffload ──► compositor
 ```
 
 The pipeline renders each frame into a dma-buf, a GPU buffer that can be
@@ -47,7 +48,7 @@ reaches the screen without being copied. A sync file attached to the buffer
 lets the compositor, not the application, wait for the GPU to finish. The
 software pipeline, which has no dma-buf, uploads its pixels to GTK instead.
 
-The shaders of both pipelines are generated from the JSL sources of JavaFX.
+The shaders of the pipelines are generated from the JSL sources of JavaFX.
 
 ### Robot
 
@@ -126,7 +127,9 @@ The build compiles the GTK 4 wrappers and the Vulkan bindings kept in
 `src/generated`, and generates the shaders: the Vulkan GLSL of the Prism and
 Decora shaders from JSL, compiled to SPIR-V, and their OpenGL 4.5 core GLSL,
 from the `-gl` backend of the JSL compiler, with the static Vulkan shaders
-converted for OpenGL.
+converted for OpenGL. The `es2egl` pipeline uses the GLSL of the `-es2`
+backend for Prism, the Phong shaders of the ES2 pipeline (`shaders/es2`) and
+the ES2 shaders of Decora that JavaFX passes to it.
 
 `./gradlew generateBindings` regenerates the wrappers and the bindings, for
 a change of the types or the Vulkan commands they cover (the lists in
@@ -176,6 +179,16 @@ from Maven Central, or an SDK built from source. It was tested with JavaFX
   projections and exported frames: linear ARGB8888 buffers of the render
   node, synchronized with a sync file when `EGL_ANDROID_native_fence_sync` is
   available. It does not use the ES2 pipeline of JavaFX.
+- For the `es2egl` pipeline (`-Dprism.order=es2egl`): the ES2 pipeline of
+  JavaFX, from the `egl` branch of jfx, whose native library (`prism_es2`) is
+  written in Java over the Foreign Function & Memory API, in
+  `com.sun.prism.es2egl`. It needs EGL 1.5 with the GBM platform and
+  `EGL_KHR_surfaceless_context`, and OpenGL 2.1 (of the compatibility
+  profile) with framebuffer objects, on a render node (as for `gl`, or
+  `-Dprism.es2egl.device=PATH`). With no native window to draw to, it renders
+  into a render target and presents it as the `gl` pipeline does: a copy into
+  a linear dma-buf when the driver has `GL_OES_EGL_image` and
+  `EGL_EXT_image_dma_buf_import`, or its pixels otherwise.
 - A Wayland compositor (GNOME, KDE Plasma, ...). Xorg is not supported: the
   glass does not work in an X11 session, nor with `GDK_BACKEND=x11`.
 
@@ -185,12 +198,12 @@ These requirements are checked when JavaFX starts:
   older than 4.14, or lacks `GtkGraphicsOffload` or `GdkDmabufTextureBuilder`,
   and when there is no Wayland compositor (no socket at `$WAYLAND_DISPLAY`, or
   `GDK_BACKEND` selects another backend).
-- The pipelines are tried in the order of `prism.order`, `vk,gl,sw` by
-  default: Vulkan, then OpenGL when Vulkan cannot be used, and the software
-  pipeline when neither can. Software rasterizers (lavapipe, llvmpipe) are
+- The pipelines are tried in the order of `prism.order`, `vk,gl,es2egl,sw` by
+  default: Vulkan, then OpenGL 4.5 when Vulkan cannot be used, then the ES2
+  pipeline (OpenGL 2.1), and the software pipeline when none can. Software rasterizers (lavapipe, llvmpipe) are
   not used: they are slower than the software pipeline. The `vk` pipeline prints why Vulkan cannot be
   used (no loader, no Vulkan 1.3 device, no `VK_KHR_push_descriptor`, ...),
-  and the `gl` pipeline does the same for EGL and OpenGL.
+  and the `gl` and `es2egl` pipelines do the same for EGL and OpenGL.
   `-Dprism.verbose=true` shows the devices and the extensions in use.
 
 ### Command line
@@ -214,7 +227,7 @@ java --module-path=/path/to/javafx/lib --add-modules=javafx.controls \
      --add-exports=javafx.graphics/com.sun.prism.paint=ALL-UNNAMED \
      --add-exports=javafx.graphics/com.sun.prism.ps=ALL-UNNAMED \
      --add-exports=javafx.graphics/com.sun.prism.shader=ALL-UNNAMED \
-     -Dglass.platform=Gtk4 -Dprism.order=vk,gl,sw \
+     -Dglass.platform=Gtk4 -Dprism.order=vk,gl,es2egl,sw \
      -cp jfx-wayland.jar:app.jar app.Main
 ```
 
@@ -228,8 +241,9 @@ build writes them to `build/run.args`, for `java @build/run.args` (paths under t
 home directory are relative to the project directory, from where it must run).
 
 JavaFX loads `com.sun.glass.ui.gtk4.Gtk4PlatformFactory` for
-`-Dglass.platform=Gtk4`, and `com.sun.prism.vk.VKPipeline` and
-`com.sun.prism.gl.GLPipeline` for the `vk` and `gl` entries of `prism.order`. With a JavaFX that supports the `ext:` prefix, the classes
+`-Dglass.platform=Gtk4`, and `com.sun.prism.vk.VKPipeline`,
+`com.sun.prism.gl.GLPipeline` and `com.sun.prism.es2egl.ES2EGLPipeline` for
+the `vk`, `gl` and `es2egl` entries of `prism.order`. With a JavaFX that supports the `ext:` prefix, the classes
 can also be given by name: `-Dglass.platform=ext:com.sun.glass.ui.gtk4.Gtk4PlatformFactory`.
 
 | System property              | Description                                             |
@@ -265,10 +279,13 @@ be removed.
 `demos/` has two applications, which `launcher.sh` runs (see below):
 
 - `eyecandy`, the showcases of the Prism renderer in one window, chosen in
-  the middle of its header bar or with Ctrl+1 to Ctrl+5: Nebula (a planet, its
+  the middle of its header bar or with Ctrl+1 to Ctrl+7: Nebula (a planet, its
   moon, a galaxy and a nebula in 3D), Fractals (Mandelbrot and Julia sets
   computed in the background, geometric fractals and a Menger sponge),
-  Fireworks, Disco and Aurora. `-Deyecandy.show=fractals` starts on one;
+  Fireworks, Disco, Aurora, Abyss (jellyfish, lanternfish and plankton that
+  glow where the water is stirred) and Synthwave (a flight down a neon valley
+  in 3D, whose mountains dance to a beat). `-Deyecandy.show=fractals` starts
+  on one;
 - `games`, a Breakout made with [FXGL](https://github.com/AlmasB/FXGL), the
   game engine for JavaFX: its entities, collisions, input, particles,
   animations and menus. `./gradlew fxgl` downloads FXGL first, which the
@@ -328,7 +345,7 @@ the plugin is built first with `./gradlew jar`.
 |------------------------------|-----------------------------------------------------------------|
 | `--apps=a,b,...`             | Demos to run, `eyecandy` or `games`, or `all` (`eyecandy`)     |
 | `--compositor=none\|gnome\|kde\|hyprland` | Current desktop, or a nested compositor (`none`)        |
-| `--pipeline=auto\|vk\|gl\|sw`  | Prism pipeline: Vulkan, OpenGL 4.5 or software; `auto` tries them in that order (`auto`) |
+| `--pipeline=auto\|vk\|gl\|es2egl\|sw` | Prism pipeline: Vulkan, OpenGL 4.5, ES2 on EGL or software; `auto` tries them in that order (`auto`) |
 | `--backdrop=auto\|on\|off`    | Sets `glass.gtk4.backdrop`; `auto` turns it on (`auto`) |
 | `--toolbox=NAME`             | Toolbox container of the compositor (`jfx-gnome51`, `jfx-kde`, `jfx-hyprland`), or `none` for the compositor of the host |
 | `--toolbox-release=N`        | Fedora release of a new toolbox container, a number or `rawhide` (gnome: `45`, kde and hyprland: `rawhide`) |

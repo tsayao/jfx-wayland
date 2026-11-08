@@ -399,7 +399,7 @@ tasks.register('generatePrismShaders') {
                 classpath = cp
                 mainClass = 'CompileJSL'
                 jvmArgs = shaderCompilerArgs
-                args = ['-i', sourceDir, '-o', destinationDir, '-t', '-pkg', 'com/sun/prism', '-vk', '-gl',
+                args = ['-i', sourceDir, '-o', destinationDir, '-t', '-pkg', 'com/sun/prism', '-vk', '-gl', '-es2',
                         '-name', jsl]
             }
         }
@@ -488,6 +488,17 @@ tasks.register('generateGLStaticShaders') {
     }
 }
 
+// ES2 on EGL: the GLSL of OpenGL 2.1 that the JSL compiler generates for
+// Prism and the Phong shaders of the ES2 pipeline. Decora passes its own ES2
+// shaders, from javafx.graphics, to the pipeline.
+
+tasks.register('copyPrismES2Shaders', Copy) {
+    dependsOn 'generatePrismShaders'
+    from gensrc.map { it.dir('jsl-prism/com/sun/prism/es2/glsl') }
+    from 'shaders/es2'
+    into glslDir.map { it.dir('resources/com/sun/prism/es2egl/glsl') }
+}
+
 tasks.register('generateBindings') {
     description = 'Regenerates the GTK 4 wrappers (from the GIR files) and the Vulkan bindings (from vk.xml) in src/generated'
     dependsOn 'generateGtk4Wrappers', 'generateVulkanBindings'
@@ -501,6 +512,7 @@ tasks.named('compileJava') {
 tasks.named('processResources') {
     dependsOn 'compilePrismSPIRVShaders', 'compileDecoraSPIRVShaders', 'compileVKStaticShaders'
     dependsOn 'copyPrismGLShaders', 'copyDecoraGLShaders', 'generateGLStaticShaders'
+    dependsOn 'copyPrismES2Shaders'
 }
 
 tasks.named('jar') {
@@ -511,7 +523,7 @@ def runArgs = { lib ->
     moduleArgs(lib) + [
         '--enable-native-access=javafx.graphics,ALL-UNNAMED',
         '-Dglass.platform=Gtk4',
-        '-Dprism.order=vk,gl,sw',
+        '-Dprism.order=vk,gl,es2egl,sw',
     ]
 }
 
