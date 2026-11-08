@@ -344,16 +344,16 @@ the plugin is built first with `./gradlew jar`.
 | Option                       | Description                                                     |
 |------------------------------|-----------------------------------------------------------------|
 | `--apps=a,b,...`             | Demos to run, `eyecandy` or `games`, or `all` (`eyecandy`)     |
-| `--compositor=none\|gnome\|kde\|hyprland` | Current desktop, or a nested compositor (`none`)        |
+| `--compositor=none\|gnome\|kde\|hyprland\|niri\|cosmic\|sway\|labwc\|wayfire\|weston` | Current desktop, or a nested compositor (`none`) |
 | `--pipeline=auto\|vk\|gl\|es2egl\|sw` | Prism pipeline: Vulkan, OpenGL 4.5, ES2 on EGL or software; `auto` tries them in that order (`auto`) |
 | `--backdrop=auto\|on\|off`    | Sets `glass.gtk4.backdrop`; `auto` turns it on (`auto`) |
-| `--toolbox=NAME`             | Toolbox container of the compositor (`jfx-gnome51`, `jfx-kde`, `jfx-hyprland`), or `none` for the compositor of the host |
-| `--toolbox-release=N`        | Fedora release of a new toolbox container, a number or `rawhide` (gnome: `45`, kde and hyprland: `rawhide`) |
+| `--toolbox=NAME`             | Toolbox container of the compositor (`jfx-gnome51`, or `jfx-` and the name of the compositor, such as `jfx-kde`), or `none` for the compositor of the host |
+| `--toolbox-release=N`        | Fedora release of a new toolbox container, a number or `rawhide` (gnome: `45`, the others: `rawhide`) |
 | `--wallpaper=FILE`           | gnome: desktop image (the host wallpaper)                      |
-| `--size=WxH`, `--scale=N`    | gnome, kde, hyprland: size of the nested output (2400x1440); kde, hyprland: its scale |
+| `--size=WxH`, `--scale=N`    | gnome, kde, hyprland, sway, wayfire, weston: size of the nested output (2400x1440); all but gnome, cosmic and labwc: its scale, a whole number for weston |
 | `--monitors=WxH@S,...`       | gnome: monitors side by side, with their scales, each in a window of its own without `--headless` (`SIZE@1`) |
 | `--headless`                 | gnome: no window on the desktop, virtual monitors instead; the host focus does not matter |
-| `--screenshot=FILE`          | gnome, kde: screenshot of the nested desktop                   |
+| `--screenshot=FILE`          | gnome, kde, niri, cosmic, sway, labwc, wayfire: screenshot of the nested desktop (with grim on niri, cosmic and wlroots) |
 | `--list`, `--help`           | Lists the demos, or shows all the options                      |
 
 Arguments after `--` are passed to the JVM of the demos. The logs are written
@@ -365,7 +365,14 @@ than the one of the host can be used: with `--compositor=gnome`, GNOME Shell
 Plasma desktop from Fedora Rawhide (`jfx-kde`), and with
 `--compositor=hyprland`, Hyprland from Fedora Rawhide and the
 [lionheartp/Hyprland](https://copr.fedorainfracloud.org/coprs/lionheartp/Hyprland/)
-COPR, as Fedora does not ship it (`jfx-hyprland`). When the container does not
+COPR, as Fedora does not ship it (`jfx-hyprland`). `--compositor=niri` runs
+niri from Fedora Rawhide (`jfx-niri`), which has backdrops from niri 26.04,
+and `--compositor=cosmic` the compositor of COSMIC (`jfx-cosmic`), whose
+releases until 1.11 have none.
+`sway`, `labwc` and `wayfire`, the compositors of wlroots, and `weston`, the
+reference compositor, also run from Fedora Rawhide (`jfx-sway` and so on);
+they have no backdrops, and test the opaque windows and their protocols.
+When the container does not
 exist, the launcher asks before creating it and installing the compositor,
 the JDK, GTK 4 and the Vulkan drivers in it. This needs
 [toolbox](https://github.com/containers/toolbox) (the `podman-toolbox`

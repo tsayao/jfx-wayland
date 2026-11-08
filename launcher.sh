@@ -37,6 +37,18 @@
 #          Hyprland in a toolbox container of Fedora Rawhide, created in the
 #          same way, with the lionheartp/Hyprland COPR, as Fedora does not
 #          ship Hyprland.
+#   niri   niri (26.04 or later for the backdrop) in a toolbox container of
+#          Fedora Rawhide, created in the same way.
+#   cosmic the compositor of COSMIC in a toolbox container of Fedora
+#          Rawhide, created in the same way; its releases until 1.11 have no
+#          backdrops.
+#   sway, labwc, wayfire
+#          the wlroots compositors, in toolbox containers of Fedora Rawhide,
+#          created in the same way; without backdrops, for the opaque windows
+#          and the protocols of wlroots.
+#   weston the reference compositor, in a toolbox container of Fedora
+#          Rawhide, created in the same way; without backdrops, for the core
+#          protocols only.
 #
 # A nested compositor runs on a private D-Bus session with its own settings,
 # so it leaves the running desktop untouched, and is closed when the last demo
@@ -50,7 +62,7 @@
 # Options:
 #   --apps=a,b,...          demos to run, by name (see --list), or "all"
 #                           (eyecandy)
-#   --compositor=gnome|kde|hyprland|none
+#   --compositor=gnome|kde|hyprland|niri|cosmic|sway|labwc|wayfire|weston|none
 #                           nested compositor, or none for the current
 #                           desktop (none)
 #   --pipeline=auto|vk|gl|es2egl|sw
@@ -60,21 +72,27 @@
 #   --backdrop=auto|on|off  blur the area behind the windows; auto blurs it
 #                           (auto)
 #   --toolbox=NAME          toolbox container of the nested compositor
-#                           (jfx-gnome51, jfx-kde, jfx-hyprland), or "none" to use the
-#                           compositor of the host
+#                           (jfx-gnome51, or jfx- and the name of the
+#                           compositor), or "none" to use the compositor of
+#                           the host
 #   --toolbox-release=N     Fedora release of a new toolbox container, a
-#                           number or rawhide (gnome: 45, kde and
-#                           hyprland: rawhide)
+#                           number or rawhide (gnome: 45, the others:
+#                           rawhide)
 #   --wallpaper=FILE        gnome: image of the desktop (the host wallpaper)
-#   --size=WxH              gnome, kde, hyprland: size of the nested output (2400x1440)
-#   --scale=N               kde, hyprland: output scale (1)
+#   --size=WxH              gnome, kde, hyprland, sway, wayfire, weston: size
+#                           of the nested output (2400x1440); niri, cosmic
+#                           and labwc open a window of their own size
+#   --scale=N               kde, hyprland, niri, sway, wayfire, weston: output
+#                           scale, a whole number for weston (1)
 #   --monitors=WxH@S,...    gnome: monitors of the nested shell, side by side,
 #                           with their scales, each in a window of its own
 #                           without --headless (SIZE@1)
 #   --headless              gnome: run the nested shell without a window, on
 #                           a virtual monitor of --size: nothing shows on the
 #                           desktop and the focus on the host does not matter
-#   --screenshot=FILE       gnome, kde: save a screenshot of the nested desktop
+#   --screenshot=FILE       gnome, kde, niri, cosmic, sway, labwc, wayfire:
+#                           save a screenshot of the nested desktop (with
+#                           grim on niri, cosmic and the wlroots compositors)
 #   --screenshot-delay=S    seconds to wait before the screenshot (12);
 #                           with --headless, the session then ends
 #   --list                  list the demos and exit
@@ -199,8 +217,17 @@ $TOOLBOX_PACKAGES" ;;
             : "${TOOLBOX:=jfx-hyprland}" "${TOOLBOX_RELEASE:=rawhide}"
             TOOLBOX_COPR=lionheartp/Hyprland
             TOOLBOX_PACKAGES="hyprland hyprland-guiutils xdg-desktop-portal-hyprland $TOOLBOX_PACKAGES" ;;
+        niri|sway|labwc|wayfire)
+            : "${TOOLBOX:=jfx-$COMPOSITOR}" "${TOOLBOX_RELEASE:=rawhide}"
+            TOOLBOX_PACKAGES="$COMPOSITOR grim $TOOLBOX_PACKAGES" ;;
+        cosmic)
+            : "${TOOLBOX:=jfx-cosmic}" "${TOOLBOX_RELEASE:=rawhide}"
+            TOOLBOX_PACKAGES="cosmic-comp grim $TOOLBOX_PACKAGES" ;;
+        weston)
+            : "${TOOLBOX:=jfx-weston}" "${TOOLBOX_RELEASE:=rawhide}"
+            TOOLBOX_PACKAGES="weston $TOOLBOX_PACKAGES" ;;
         none) ;;
-        *) fail "Unknown compositor: $COMPOSITOR (gnome, kde, hyprland or none)" ;;
+        *) fail "Unknown compositor: $COMPOSITOR (gnome, kde, hyprland, niri, cosmic, sway, labwc, wayfire, weston or none)" ;;
     esac
 }
 
@@ -558,7 +585,7 @@ start_atspi() {
 
 screenshot_unsupported() {
     if [ -n "$SCREENSHOT" ]; then
-        echo "--screenshot is only supported with --compositor=gnome" >&2
+        echo "--screenshot is not supported with --compositor=$COMPOSITOR" >&2
     fi
 }
 
@@ -785,6 +812,124 @@ hyprland_socket() {
         done
         sleep 0.2
     done
+}
+
+# The compositors that name their socket themselves run this script when
+# they start, which writes the name
+write_announce() {
+    rm -f "$LOGS/socket"
+    cat > "$LOGS/announce" <<EOF
+#!/bin/sh
+printf '%s' "\$WAYLAND_DISPLAY" > "$LOGS/socket"
+EOF
+    chmod +x "$LOGS/announce"
+}
+
+announced_socket() {
+    for i in $(seq 1 100); do
+        if [ -s "$LOGS/socket" ]; then
+            cat "$LOGS/socket"
+            return
+        fi
+        sleep 0.2
+    done
+}
+
+# After the start of a compositor that announces its socket, in the
+# background as $1
+use_announced_socket() {
+    CHILDREN="$CHILDREN $1"
+    SOCKET=$(announced_socket)
+    [ -n "$SOCKET" ] || fail "The nested compositor did not start, see $LOGS" 1
+    wait_for_socket
+    use_nested_display
+    schedule_grim_screenshot
+}
+
+# A screenshot of the nested desktop after a delay, through the screen copy
+# protocols of niri and wlroots
+schedule_grim_screenshot() {
+    if [ -n "$SCREENSHOT" ]; then
+        (sleep "$SCREENSHOT_DELAY"; exec grim "$SCREENSHOT") > "$LOGS/screenshot.log" 2>&1 &
+        CHILDREN="$CHILDREN $!"
+    fi
+}
+
+# niri opens a window of the winit backend, whose output is named winit
+start_niri() {
+    export XDG_CURRENT_DESKTOP=niri
+    write_announce
+    cat > "$LOGS/niri.kdl" <<EOF
+output "winit" {
+    scale $SCALE
+}
+hotkey-overlay {
+    skip-at-startup
+}
+spawn-at-startup "$LOGS/announce"
+EOF
+    (exec niri --config "$LOGS/niri.kdl") > "$LOGS/niri.log" 2>&1 &
+    use_announced_socket $!
+}
+
+# cosmic-comp runs the command of its arguments, in a window of the winit
+# backend, and ends when it ends: so the script that announces the socket
+# then waits. The demos are Wayland clients only, without Xwayland
+start_cosmic() {
+    export XDG_CURRENT_DESKTOP=COSMIC
+    write_announce
+    echo 'exec sleep infinity' >> "$LOGS/announce"
+    (exec cosmic-comp --no-xwayland "$LOGS/announce") > "$LOGS/cosmic.log" 2>&1 &
+    use_announced_socket $!
+}
+
+# The output of the Wayland backend of wlroots is named WL-1
+start_sway() {
+    export XDG_CURRENT_DESKTOP=sway
+    write_announce
+    cat > "$LOGS/sway.conf" <<EOF
+output * resolution $SIZE scale $SCALE
+exec $LOGS/announce
+EOF
+    (exec sway --config "$LOGS/sway.conf") > "$LOGS/sway.log" 2>&1 &
+    use_announced_socket $!
+}
+
+start_labwc() {
+    export XDG_CURRENT_DESKTOP=labwc:wlroots
+    write_announce
+    mkdir -p "$LOGS/labwc"
+    cp "$LOGS/announce" "$LOGS/labwc/autostart"
+    printf '<?xml version="1.0"?>\n<labwc_config/>\n' > "$LOGS/labwc/rc.xml"
+    (exec labwc --config-dir "$LOGS/labwc") > "$LOGS/labwc.log" 2>&1 &
+    use_announced_socket $!
+}
+
+# Without the panel and the background of wf-shell, which is not installed
+start_wayfire() {
+    export XDG_CURRENT_DESKTOP=Wayfire
+    write_announce
+    cat > "$LOGS/wayfire.ini" <<EOF
+[output:WL-1]
+mode = $SIZE
+scale = $SCALE
+
+[autostart]
+autostart_wf_shell = false
+announce = $LOGS/announce
+EOF
+    (exec wayfire --config "$LOGS/wayfire.ini") > "$LOGS/wayfire.log" 2>&1 &
+    use_announced_socket $!
+}
+
+start_weston() {
+    export XDG_CURRENT_DESKTOP=weston
+    (exec weston --backend=wayland --socket="$SOCKET" --width="${SIZE%x*}" --height="${SIZE#*x}" \
+        --scale="$SCALE" --idle-time=0) > "$LOGS/weston.log" 2>&1 &
+    CHILDREN="$CHILDREN $!"
+    wait_for_socket
+    use_nested_display
+    screenshot_unsupported
 }
 
 # ---------------------------------------------------------------------------

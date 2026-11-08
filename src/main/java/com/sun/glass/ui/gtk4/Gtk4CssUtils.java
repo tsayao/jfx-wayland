@@ -82,6 +82,15 @@ final class Gtk4CssUtils {
             window.jfx-dark .jfx-header-controls windowcontrols > button:active {
               background-color: rgba(255, 255, 255, 0.25);
             }
+            /* The controls of the extended windows float over the content of
+               the application, whatever its colors, where the hover of a title
+               bar (10% to 15% of the color of the icon) does not show */
+            windowcontrols.jfx-overlay-controls > button:hover > image {
+              background-color: alpha(currentColor, 0.28);
+            }
+            windowcontrols.jfx-overlay-controls > button:active > image {
+              background-color: alpha(currentColor, 0.42);
+            }
             popover.jfx-popover,
             popover.jfx-popover > contents {
               background-color: transparent;

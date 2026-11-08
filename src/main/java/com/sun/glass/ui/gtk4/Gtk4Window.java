@@ -459,6 +459,7 @@ public class Gtk4Window extends Window implements DmaBufPresenter {
      * there the controls get one, without its background.
      */
     private static GtkWidget headerControls(GtkWindowControls controls, int halign) {
+        controls.addCssClass("jfx-overlay-controls");
         controls.setHAlign(halign);
         controls.setVAlign(Gtk.ALIGN_START);
         if (Gtk4Application.ADWAITA) {
